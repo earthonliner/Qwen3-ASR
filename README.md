@@ -38,6 +38,7 @@ We release **Qwen3-ASR**, a family that includes two powerful all-in-one speech 
     - [Streaming Inference](#streaming-inference)
     - [ForcedAligner Usage](#forcedaligner-usage)
   - [DashScope API Usage](#dashscope-api-usage)
+- [macOS (Apple Silicon) 本地运行指南 · 课堂录音转写](#macos-apple-silicon-本地运行指南--课堂录音转写)
 - [Launch Local Web UI Demo](#launch-local-web-ui-demo)
   - [Gradio Demo](#gradio-demo)
   - [Streaming Demo](#streaming-demo)
@@ -326,6 +327,98 @@ To further explore Qwen3-ASR, we encourage you to try our DashScope API for a fa
 | Real-time API for Qwen3-ASR. | [https://help.aliyun.com/zh/model-studio/qwen-real-time-speech-recognition](https://help.aliyun.com/zh/model-studio/qwen-real-time-speech-recognition) | [https://www.alibabacloud.com/help/en/model-studio/qwen-real-time-speech-recognition](https://www.alibabacloud.com/help/en/model-studio/qwen-real-time-speech-recognition) |
 | FileTrans API for Qwen3-ASR. | [https://help.aliyun.com/zh/model-studio/qwen-speech-recognition](https://help.aliyun.com/zh/model-studio/qwen-speech-recognition) | [https://www.alibabacloud.com/help/en/model-studio/qwen-speech-recognition](https://www.alibabacloud.com/help/en/model-studio/qwen-speech-recognition) |
 
+
+## macOS (Apple Silicon) 本地运行指南 · 课堂录音转写
+
+> 本节面向想在 **MacBook Air / Pro（M1/M2/M3 等 Apple Silicon）** 上离线运行 **Qwen3-ASR-0.6B**，用来**录制并转写老师与学生课堂对话**的用户。以 **MacBook Air M2 / 16GB** 为例。
+
+### 为什么用 0.6B + transformers 后端
+
+- **vLLM 后端在 macOS 上不可用**，Apple Silicon 也无法安装 `flash-attn`。因此在 Mac 上请使用 **transformers 后端**，并借助 **MPS（Metal）** 做 GPU 加速。
+- **0.6B** 模型体量小（bf16/fp16 权重约 1~2GB），在 **16GB 统一内存**的 M2 上可以流畅离线运行；1.7B 也能跑，但更吃内存、更慢，日常课堂转写推荐 **0.6B**。
+- 该模型只做 **语音识别 + 时间戳对齐**，**不做说话人分离（diarization）**，所以无法自动区分「哪句是老师、哪句是学生」；开启时间戳后可按时间顺序回看整段对话。
+
+### 一键安装
+
+仓库内提供了安装脚本 [`scripts/setup_mac.sh`](scripts/setup_mac.sh)，会自动安装 `ffmpeg`、`portaudio`、PyTorch（含 MPS）、`qwen-asr` 以及录音依赖 `sounddevice`：
+
+```bash
+git clone https://github.com/QwenLM/Qwen3-ASR.git
+cd Qwen3-ASR
+
+# 需要先安装 Homebrew（https://brew.sh）
+bash scripts/setup_mac.sh
+
+# 国内网络推荐用 ModelScope 预下载模型权重（可选）：
+# USE_MODELSCOPE=1 bash scripts/setup_mac.sh
+```
+
+如果你更喜欢手动安装：
+
+```bash
+# 系统依赖（录音与音视频解码）
+brew install ffmpeg portaudio
+
+# 建议使用独立的 Python 3.12 环境
+conda create -n qwen3-asr python=3.12 -y
+conda activate qwen3-asr
+
+# PyTorch 的 macOS 官方 wheel 已内置 MPS 支持
+pip install -U torch torchaudio
+pip install -U qwen-asr        # transformers 后端
+pip install -U sounddevice     # 麦克风录音
+
+# 注意：不要在 Mac 上安装 qwen-asr[vllm] 或 flash-attn（不支持）
+```
+
+> 从 HuggingFace 下载模型较慢时，可先设置镜像：`export HF_ENDPOINT=https://hf-mirror.com`
+
+### 录制并转写课堂对话
+
+仓库内提供了脚本 [`scripts/record_and_transcribe.py`](scripts/record_and_transcribe.py)，支持「现场录音」与「转写已有文件」两种模式。
+
+**方式一：上课时现场录音，下课按 `Ctrl+C` 结束并自动转写**
+
+```bash
+# 自动检测语言（适合中英混说的课堂），并输出逐词/逐字时间戳
+python scripts/record_and_transcribe.py --record --timestamps
+
+# 也可强制指定语言，识别更稳
+python scripts/record_and_transcribe.py --record --language Chinese --timestamps
+```
+
+第一次运行时，请在 **系统设置 → 隐私与安全性 → 麦克风** 中允许终端（或你的 IDE）访问麦克风。录音文件与转写文本默认保存在 `./recordings/` 目录下。
+
+**方式二：转写课后导出的录音/录像文件（wav / mp3 / m4a / mp4 …）**
+
+```bash
+python scripts/record_and_transcribe.py --audio ./lesson.m4a --language Chinese --timestamps
+```
+
+**若用 ModelScope 预下载了模型，用 `--model` 指向本地目录：**
+
+```bash
+python scripts/record_and_transcribe.py --record --model ./models/Qwen3-ASR-0.6B
+```
+
+常用参数（完整列表见 `python scripts/record_and_transcribe.py --help`）：
+
+| 参数 | 说明 |
+|---|---|
+| `--record` / `--audio PATH` | 现场录音 / 转写已有文件（二选一） |
+| `--duration SECONDS` | 录音模式下的最长录制秒数（不填则录到 `Ctrl+C`） |
+| `--language` | 强制语言（如 `Chinese`/`English`）；不填则自动检测 |
+| `--timestamps` | 额外加载 ForcedAligner 输出逐词/逐字时间戳 |
+| `--model` | ASR 模型名或本地目录（默认 `Qwen/Qwen3-ASR-0.6B`） |
+| `--device` | `auto`/`mps`/`cpu`（默认 `auto`，在 Apple Silicon 上自动选 `mps`） |
+| `--output-dir` | 录音与转写结果的保存目录（默认 `./recordings`） |
+
+### 常见问题
+
+- **速度慢？** 确认日志里显示 `使用设备：mps`。首次运行需下载模型权重与做 MPS 预热，之后会明显变快。长音频会被自动分段处理，请耐心等待。
+- **报错 `sounddevice` / PortAudio 找不到设备？** 先 `brew install portaudio` 再 `pip install -U sounddevice`，并检查麦克风权限。
+- **内存吃紧？** 使用默认的 0.6B 模型；脚本已将 `max_inference_batch_size` 设为 1。可关闭 `--timestamps` 以省去对齐模型的额外开销。
+- **想跑 1.7B？** 加 `--model Qwen/Qwen3-ASR-1.7B` 即可，但在 16GB 机器上更慢、更容易吃满内存，日常转写建议仍用 0.6B。
 
 ## Launch Local Web UI Demo
 
