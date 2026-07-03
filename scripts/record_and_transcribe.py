@@ -14,34 +14,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-在 Apple Silicon Mac（如 MacBook Air M2 / 16GB）上，用 Qwen3-ASR-0.6B 录制并转写
+在 Apple Silicon Mac（如 MacBook Air M2 / 16GB）上，用 Qwen3-ASR 录制并转写
 课堂上老师与学生的对话。
 
-支持三套模型/后端，脚本会根据模型名自动选择：
+支持两套模型/后端，按模型名自动选择：
 
-1) MLX 版（Apple Silicon 上最快，推荐；模型名含 mlx，如 mlx-community/Qwen3-ASR-0.6B-8bit）
-   - 用 mlx-audio：pip install mlx-audio
+1) MLX（推荐，Apple Silicon 上最快；模型名含 mlx，如 mlx-community/Qwen3-ASR-0.6B-8bit）
+   - 依赖：pip install mlx-audio
 
-2) transformers 原生版（带 -hf 后缀的仓库，如 Qwen/Qwen3-ASR-0.6B-hf）
-   - 用 🤗 transformers 原生的 AutoModelForMultimodalLM + processor.apply_transcription_request
-   - 需要较新的 transformers（含 Qwen3-ASR 原生支持）
-
-3) qwen-asr 包版（不带 -hf 的仓库，如 Qwen/Qwen3-ASR-0.6B）
-   - 用 qwen_asr.Qwen3ASRModel
+2) transformers 原生（-hf 后缀仓库，如 Qwen/Qwen3-ASR-0.6B-hf，走 MPS/Metal）
+   - 依赖：PyTorch >= 2.4 + 含 qwen3_asr 支持的 transformers（源码开发版）
 
 两种使用方式：
 
    # 现场录音后转写（讲课过程中运行，结束时按 Ctrl+C 停止录音）
-   python scripts/record_and_transcribe.py --record --model mlx-community/Qwen3-ASR-0.6B-8bit --timestamps
+   python scripts/record_and_transcribe.py --record --timestamps
 
    # 转写一个已有的音频/视频文件（wav / mp3 / m4a / mp4 …，需已安装 ffmpeg）
-   python scripts/record_and_transcribe.py --audio ./lesson.m4a --model mlx-community/Qwen3-ASR-1.7B-4bit --language Chinese
+   python scripts/record_and_transcribe.py --audio ./lesson.m4a --language Chinese
 
 说明：
-- macOS 上通过 MPS(Metal) 做 GPU 加速；vLLM 在 macOS 上不可用。
-- 0.6B 模型在 16GB 内存的 M2 上可离线运行；长音频会自动分段处理。
-- 该模型只做「语音识别 + 时间戳」，不做说话人分离(diarization)，
-  因此无法自动区分「谁是老师、谁是学生」；时间戳可帮助你按时间顺序回看对话。
+- 模型只做「语音识别 + 时间戳」，不做说话人分离(diarization)，
+  无法自动区分「谁是老师、谁是学生」；时间戳可帮助按时间顺序回看对话。
+- 长音频会按 --chunk-seconds 自动分段处理。
 """
 
 import argparse
@@ -53,7 +48,7 @@ import tempfile
 import time
 from typing import List, Optional, Tuple
 
-# 让 MPS 上不支持的算子自动回退到 CPU，避免在 Apple Silicon 上直接报错。
+# 让 MPS 上不支持的算子自动回退到 CPU（transformers 后端用）
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import numpy as np
@@ -62,50 +57,48 @@ SAMPLE_RATE = 16000  # Qwen3-ASR 使用 16kHz 单声道输入
 
 
 # ---------------------------------------------------------------------------
-# 后端 / 设备 / 精度选择
+# 后端 / 设备选择
 # ---------------------------------------------------------------------------
 def resolve_backend(backend: str, model_name: str) -> str:
     """
     auto 时按模型名判断：
-      - 名字里含 mlx（如 mlx-community/...、Qwen3-ASR-0.6B-8bit-mlx）→ mlx 后端
+      - 名字含 mlx（如 mlx-community/...）→ mlx 后端
       - 带 -hf 后缀 → transformers 原生后端
-      - 其余 → qwen-asr 包后端
     """
     if backend != "auto":
         return backend
     name = str(model_name).rstrip("/")
-    base = os.path.basename(name)
     if "mlx" in name.lower():
         return "mlx"
-    return "transformers" if base.endswith("-hf") else "package"
+    if os.path.basename(name).endswith("-hf"):
+        return "transformers"
+    raise SystemExit(
+        f"无法从模型名判断后端：{model_name}\n"
+        "本仓库仅支持 Apple Silicon 上的两种模型：\n"
+        "  - MLX：mlx-community/Qwen3-ASR-0.6B-8bit（推荐）\n"
+        "  - transformers 原生：Qwen/Qwen3-ASR-0.6B-hf\n"
+        "也可用 --backend mlx / transformers 手动指定。"
+    )
 
 
 def pick_device(requested: str) -> str:
-    """选择运行设备：auto 时优先 Apple Silicon 的 mps，否则回退到 cpu。"""
+    """transformers 后端设备：auto 时优先 mps，否则 cpu。"""
     import torch
 
     if requested != "auto":
         return requested
-
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
         return "mps"
-    if torch.cuda.is_available():
-        return "cuda:0"
     return "cpu"
 
 
 def pick_dtype(requested: str, device: str):
-    """选择精度：mps 默认 float16，cpu 默认 float32（更稳）。"""
+    """transformers 后端精度：mps 用 float16，cpu 用 float32。"""
     import torch
 
     if requested != "auto":
         return {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[requested]
-
-    if device.startswith("mps"):
-        return torch.float16
-    if device.startswith("cuda"):
-        return torch.bfloat16
-    return torch.float32
+    return torch.float16 if device.startswith("mps") else torch.float32
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +119,7 @@ def record_from_microphone(max_seconds: Optional[float] = None) -> np.ndarray:
         raise SystemExit(
             "缺少 sounddevice 依赖，无法录音。请先安装：\n"
             "    pip install sounddevice\n"
-            "并确保系统已安装 portaudio（macOS：brew install portaudio）。\n"
+            "并确保系统已安装 portaudio（brew install portaudio）。\n"
             f"原始错误：{e}"
         )
 
@@ -198,7 +191,7 @@ def split_fixed(audio: np.ndarray, chunk_seconds: float) -> List[Tuple[np.ndarra
 
 
 # ---------------------------------------------------------------------------
-# 输出格式化
+# 输出格式化 / 解析
 # ---------------------------------------------------------------------------
 def _fmt_ts(seconds: float) -> str:
     total = float(seconds)
@@ -211,13 +204,28 @@ def _fmt_ts(seconds: float) -> str:
 
 
 def format_timestamps(timestamps: Optional[List[dict]]) -> str:
-    """把统一后的时间戳列表 [{text,start_time,end_time}] 汇总为可读文本。"""
+    """把时间戳列表 [{text,start_time,end_time}] 汇总为可读文本。"""
     if not timestamps:
         return ""
     lines = []
     for item in timestamps:
         lines.append(f"[{_fmt_ts(item['start_time'])} -> {_fmt_ts(item['end_time'])}] {item['text']}")
     return "\n".join(lines)
+
+
+def _parse_raw_asr(raw: str, forced_language: Optional[str]) -> Tuple[str, str]:
+    """从原始解码文本里解析出 (language, text)，兼容 'language X<asr_text>...' 格式。"""
+    s = (raw or "").strip()
+    lang = forced_language or ""
+    text = s
+    if "<asr_text>" in s:
+        meta, text = s.split("<asr_text>", 1)
+        m = re.search(r"language\s+([A-Za-z]+)", meta)
+        if m and not lang:
+            lang = m.group(1)
+    text = re.sub(r"<\|.*?\|>", "", text)
+    text = text.replace("<asr_text>", "").strip()
+    return lang, text
 
 
 def write_outputs(args, text: str, language: str, timestamps: Optional[List[dict]],
@@ -252,7 +260,7 @@ def write_outputs(args, text: str, language: str, timestamps: Optional[List[dict
 
 
 # ---------------------------------------------------------------------------
-# 后端 A0：MLX（mlx-community 模型，Apple Silicon 最快）
+# 后端 A：MLX（推荐）
 # ---------------------------------------------------------------------------
 def _patch_mlx_lm_transformers_compat() -> None:
     """
@@ -292,7 +300,6 @@ def _load_mlx_model(model_path: str):
         raise SystemExit(
             "缺少 mlx-audio，无法使用 MLX 后端。请安装：\n"
             "    pip install -U mlx-audio\n"
-            "（仅支持 Apple Silicon 的 macOS。）\n"
             f"原始错误：{e}"
         )
     return _load(model_path)
@@ -391,12 +398,12 @@ def run_mlx_backend(args, audio_16k: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# 后端 A：transformers 原生（-hf 模型）
+# 后端 B：transformers 原生（-hf 模型，MPS）
 # ---------------------------------------------------------------------------
 def _ensure_torch_enabled_in_transformers() -> None:
     """
-    新版 transformers 需要较新的 PyTorch（>= 2.4）。若 PyTorch 太旧，transformers 会
-    「禁用 PyTorch」，导致模型无法加载、processor 也缺少音频相关方法。这里给出精确报错。
+    新版 transformers 需要 PyTorch >= 2.4，否则会「禁用 PyTorch」，导致模型无法加载、
+    processor 缺少音频相关方法。这里给出精确报错。
     """
     import torch
 
@@ -412,45 +419,33 @@ def _ensure_torch_enabled_in_transformers() -> None:
         import platform
 
         arch_hint = ""
-        if platform.system() == "Darwin" and platform.machine() == "x86_64":
+        if platform.machine() == "x86_64":
             arch_hint = (
                 "\n\n⚠️ 检测到当前 Python 是 x86_64（Intel / Rosetta）架构！\n"
-                "   PyTorch 在 macOS 上最后的 Intel 版本就是 2.2.2，所以 pip 找不到 >=2.4，\n"
-                "   这几乎肯定是因为你的 conda/Python 环境不是 Apple Silicon 原生（arm64）。\n"
-                "   需要新建一个原生 arm64 环境（示例）：\n"
+                "   PyTorch 在 macOS 上最后的 Intel 版本是 2.2.2，需要新建 Apple Silicon 原生（arm64）环境：\n"
                 "       CONDA_SUBDIR=osx-arm64 conda create -n qwen3-asr-arm python=3.12 -y\n"
                 "       conda activate qwen3-asr-arm\n"
-                "       conda config --env --set subdir osx-arm64\n"
-                "       python -c \"import platform; print(platform.machine())\"   # 应显示 arm64\n"
-                "   然后重新安装依赖：pip install -U 'torch>=2.4' torchaudio transformers ..."
+                "       conda config --env --set subdir osx-arm64"
             )
         raise SystemExit(
-            f"检测到 PyTorch {torch.__version__}，但当前 transformers 需要 PyTorch >= 2.4，"
-            "否则会禁用 PyTorch，导致 -hf 模型无法加载。\n\n"
-            "请升级 PyTorch（Apple Silicon 原生 wheel 已内置 MPS）：\n"
-            "    pip install -U 'torch>=2.4' torchaudio"
-            f"{arch_hint}\n\n升级后重新运行本脚本即可。"
+            f"检测到 PyTorch {torch.__version__}，但当前 transformers 需要 PyTorch >= 2.4。\n"
+            "请升级：pip install -U 'torch>=2.4' torchaudio"
+            f"{arch_hint}"
         )
 
 
 def _ensure_native_qwen3_asr_support(model_path: str) -> None:
-    """
-    检查当前 transformers 是否原生认识 `qwen3_asr` 架构。很多已发布版本尚未包含，
-    需要从源码安装开发版。这里在真正加载前给出清晰指引，避免难懂的 KeyError 堆栈。
-    """
+    """检查当前 transformers 是否原生认识 `qwen3_asr` 架构（很多发布版尚未包含）。"""
     from transformers import AutoConfig
 
     try:
         AutoConfig.from_pretrained(model_path)
-    except Exception as e:  # KeyError / ValueError: model type qwen3_asr not recognized
+    except Exception as e:
         msg = str(e)
         if "qwen3_asr" in msg or "does not recognize this architecture" in msg:
             raise SystemExit(
-                "当前 transformers 不认识 `qwen3_asr` 架构，说明这个版本还没有内置 Qwen3-ASR 原生支持。\n"
-                "请安装含该支持的 transformers 开发版（-hf 模型必需）：\n\n"
-                "    pip install -U 'git+https://github.com/huggingface/transformers'\n\n"
-                "安装后可用这条命令确认：\n"
-                "    python -c \"from transformers import Qwen3ASRForConditionalGeneration; print('ok')\"\n"
+                "当前 transformers 不认识 `qwen3_asr` 架构。请安装含该支持的开发版：\n"
+                "    pip install -U 'git+https://github.com/huggingface/transformers'\n"
             )
         raise
 
@@ -458,18 +453,13 @@ def _ensure_native_qwen3_asr_support(model_path: str) -> None:
 def _import_asr_model_class():
     import transformers
 
-    # 优先用显式类，避免 AutoModelForMultimodalLM 在某些版本上解析成空模型类型。
     for name in ("Qwen3ASRForConditionalGeneration", "AutoModelForMultimodalLM"):
         cls = getattr(transformers, name, None)
         if cls is not None:
             return cls
     raise SystemExit(
-        "当前 transformers 版本没有 Qwen3-ASR 的原生支持（找不到 Qwen3ASRForConditionalGeneration / "
-        "AutoModelForMultimodalLM）。\n"
-        "使用 -hf 模型需要较新的 transformers，请升级：\n"
-        "    pip install -U transformers\n"
-        "或安装开发版：\n"
-        "    pip install -U git+https://github.com/huggingface/transformers\n"
+        "当前 transformers 版本没有 Qwen3-ASR 的原生支持。请安装开发版：\n"
+        "    pip install -U 'git+https://github.com/huggingface/transformers'\n"
     )
 
 
@@ -478,7 +468,6 @@ def _prepare_asr_inputs(processor, audio_path: str, language: Optional[str]):
     if hasattr(processor, "apply_transcription_request"):
         return processor.apply_transcription_request(audio=audio_path, language=language)
 
-    # 回退：手动拼 chat template（兼容不同 transformers 版本）
     messages = []
     if language:
         messages.append({"role": "system", "content": [{"type": "text", "text": language}]})
@@ -486,22 +475,6 @@ def _prepare_asr_inputs(processor, audio_path: str, language: Optional[str]):
     return processor.apply_chat_template(
         [messages], tokenize=True, return_dict=True, add_generation_prompt=True,
     )
-
-
-def _parse_raw_asr(raw: str, forced_language: Optional[str]) -> Tuple[str, str]:
-    """从原始解码文本里解析出 (language, text)，兼容 'language X<asr_text>...' 格式。"""
-    s = (raw or "").strip()
-    lang = forced_language or ""
-    text = s
-    if "<asr_text>" in s:
-        meta, text = s.split("<asr_text>", 1)
-        m = re.search(r"language\s+([A-Za-z]+)", meta)
-        if m and not lang:
-            lang = m.group(1)
-    # 去掉可能残留的特殊 token，如 <|im_end|> / <asr_text> 等
-    text = re.sub(r"<\|.*?\|>", "", text)
-    text = text.replace("<asr_text>", "").strip()
-    return lang, text
 
 
 def _decode_asr(processor, generated_ids, forced_language: Optional[str]) -> Tuple[str, str]:
@@ -577,7 +550,7 @@ def run_transformers_backend(args, audio_16k: np.ndarray, device: str, dtype,
             if args.timestamps and text:
                 ts = _align_transformers(
                     aligner_model, aligner_processor, tmp_path, text,
-                    lang or args.language or "English", offset, device,
+                    lang or args.language or "English", offset,
                 )
                 all_ts.extend(ts)
         finally:
@@ -588,7 +561,6 @@ def run_transformers_backend(args, audio_16k: np.ndarray, device: str, dtype,
         print()
     print(f"转写完成，用时 {time.time() - t0:.1f} 秒。\n")
 
-    # 合并语言（去掉连续重复）
     merged_lang: List[str] = []
     for l in all_lang:
         if l and (not merged_lang or merged_lang[-1] != l):
@@ -606,7 +578,7 @@ def run_transformers_backend(args, audio_16k: np.ndarray, device: str, dtype,
 
 
 def _align_transformers(aligner_model, aligner_processor, audio_path: str, transcript: str,
-                        language: str, offset_sec: float, device: str) -> List[dict]:
+                        language: str, offset_sec: float) -> List[dict]:
     """用 transformers 原生的 ForcedAligner 计算单段时间戳，并加上时间偏移。"""
     import torch
 
@@ -638,60 +610,11 @@ def _align_transformers(aligner_model, aligner_processor, audio_path: str, trans
 
 
 # ---------------------------------------------------------------------------
-# 后端 B：qwen-asr 包（非 -hf 模型）
-# ---------------------------------------------------------------------------
-def run_package_backend(args, audio_input, device: str, dtype,
-                        saved_wav_path: Optional[str], source: Optional[str], stamp: str) -> None:
-    from qwen_asr import Qwen3ASRModel
-
-    load_kwargs = dict(
-        dtype=dtype,
-        device_map=device,
-        max_inference_batch_size=1,
-        max_new_tokens=args.max_new_tokens,
-    )
-    if args.timestamps:
-        load_kwargs["forced_aligner"] = args.aligner
-        load_kwargs["forced_aligner_kwargs"] = dict(dtype=dtype, device_map=device)
-
-    print(f"正在加载 qwen-asr 模型：{args.model}（首次运行会自动下载权重，请耐心等待）……")
-    t0 = time.time()
-    model = Qwen3ASRModel.from_pretrained(args.model, **load_kwargs)
-    print(f"模型加载完成，用时 {time.time() - t0:.1f} 秒。开始转写……")
-
-    t0 = time.time()
-    results = model.transcribe(
-        audio=audio_input,
-        language=args.language,
-        return_time_stamps=args.timestamps,
-    )
-    print(f"转写完成，用时 {time.time() - t0:.1f} 秒。\n")
-
-    result = results[0]
-    timestamps = None
-    if args.timestamps and getattr(result, "time_stamps", None):
-        timestamps = [
-            {"text": it.text, "start_time": float(it.start_time), "end_time": float(it.end_time)}
-            for it in result.time_stamps
-        ]
-
-    write_outputs(
-        args,
-        text=result.text or "",
-        language=result.language or "",
-        timestamps=timestamps,
-        saved_wav_path=saved_wav_path,
-        source=source,
-        stamp=stamp,
-    )
-
-
-# ---------------------------------------------------------------------------
 # 命令行
 # ---------------------------------------------------------------------------
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="在 Apple Silicon Mac 上用 Qwen3-ASR-0.6B 录制并转写课堂对话。",
+        description="在 Apple Silicon Mac 上用 Qwen3-ASR 录制并转写课堂对话。",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     src = p.add_mutually_exclusive_group(required=True)
@@ -700,28 +623,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--duration", type=float, default=None,
                    help="录音模式下的最长录制秒数；不填则一直录到 Ctrl+C。")
-    p.add_argument("--model", type=str, default="Qwen/Qwen3-ASR-0.6B-hf",
-                   help="ASR 模型名或本地目录。名字含 mlx 用 MLX 后端（最快），带 -hf 用 transformers "
-                        "原生后端，其余用 qwen-asr 包后端。")
+    p.add_argument("--model", type=str, default="mlx-community/Qwen3-ASR-0.6B-8bit",
+                   help="ASR 模型名或本地目录。名字含 mlx 用 MLX 后端（推荐），带 -hf 用 transformers 原生后端。")
     p.add_argument("--backend", type=str, default="auto",
-                   choices=["auto", "mlx", "transformers", "package"],
-                   help="推理后端；auto 会根据模型名自动选择（含 mlx → mlx，-hf → transformers）。")
+                   choices=["auto", "mlx", "transformers"],
+                   help="推理后端；auto 按模型名自动选择。")
     p.add_argument("--language", type=str, default=None,
-                   help="强制识别语言（如 Chinese / English，或 zh / en）；不填则自动检测，适合中英混说的课堂。")
+                   help="强制识别语言（如 Chinese / English）；不填则自动检测，适合中英混说的课堂。")
     p.add_argument("--timestamps", action="store_true",
                    help="输出逐词/逐字时间戳（会额外加载 ForcedAligner，占用更多内存/时间）。")
     p.add_argument("--aligner", type=str, default=None,
-                   help="时间戳对齐模型（不填则根据后端自动选择 -hf / 非 -hf 版本）。")
-    p.add_argument("--device", type=str, default="auto",
-                   choices=["auto", "mps", "cpu", "cuda:0"],
-                   help="运行设备；auto 会在 Apple Silicon 上自动选择 mps。")
+                   help="时间戳对齐模型（不填则根据后端自动选择）。")
+    p.add_argument("--device", type=str, default="auto", choices=["auto", "mps", "cpu"],
+                   help="transformers 后端的运行设备；auto 优先 mps。MLX 后端自行管理设备。")
     p.add_argument("--dtype", type=str, default="auto",
                    choices=["auto", "float16", "bfloat16", "float32"],
-                   help="计算精度；auto 时 mps 用 float16、cpu 用 float32。")
+                   help="transformers 后端的计算精度；auto 时 mps 用 float16。")
     p.add_argument("--max-new-tokens", type=int, default=1024,
                    help="每段最多生成的 token 数；课堂长音频建议设大一些。")
     p.add_argument("--chunk-seconds", type=float, default=30.0,
-                   help="mlx / transformers 后端处理长音频时的分段时长（秒）。qwen-asr 后端会自行分段，忽略该值。")
+                   help="长音频的分段时长（秒）。")
     p.add_argument("--output-dir", type=str, default="./recordings",
                    help="录音与转写结果的保存目录。")
     p.add_argument("--output", type=str, default=None,
@@ -734,12 +655,12 @@ def main() -> None:
 
     backend = resolve_backend(args.backend, args.model)
 
-    # 自动选择对齐模型版本，与后端保持一致（mlx 配 mlx，-hf 配 -hf）。
+    # 自动选择对齐模型版本，与后端保持一致
     if args.aligner is None:
-        args.aligner = {
-            "mlx": "mlx-community/Qwen3-ForcedAligner-0.6B-8bit",
-            "transformers": "Qwen/Qwen3-ForcedAligner-0.6B-hf",
-        }.get(backend, "Qwen/Qwen3-ForcedAligner-0.6B")
+        args.aligner = (
+            "mlx-community/Qwen3-ForcedAligner-0.6B-8bit" if backend == "mlx"
+            else "Qwen/Qwen3-ForcedAligner-0.6B-hf"
+        )
 
     os.makedirs(args.output_dir, exist_ok=True)
     stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -747,46 +668,29 @@ def main() -> None:
     # 1) 取得音频输入
     saved_wav_path = None
     source = None
-    audio_16k = None       # transformers 后端使用的 16k np 数组
-    audio_input = None     # qwen-asr 后端使用的输入（(array, sr) 或 路径）
 
     if args.record:
         audio_16k = record_from_microphone(max_seconds=args.duration)
         saved_wav_path = os.path.join(args.output_dir, f"class_{stamp}.wav")
         save_wav(audio_16k, saved_wav_path)
         print(f"录音已保存到：{saved_wav_path}")
-        audio_input = (audio_16k, SAMPLE_RATE)
     else:
-        is_url = str(args.audio).startswith(("http://", "https://"))
-        if backend in ("transformers", "mlx") and is_url:
-            raise SystemExit(f"{backend} 后端仅支持本地文件；请先把音频下载到本地，再用 --audio 指向它。")
-        if not is_url and not os.path.exists(args.audio):
+        if not os.path.exists(args.audio):
             raise SystemExit(f"找不到音频文件：{args.audio}")
         source = args.audio
-        audio_input = args.audio  # qwen-asr 后端可直接吃路径 / URL
+        audio_16k = load_audio_16k(args.audio)
 
-    # 2) 分后端执行（MLX 自行管理设备，无需 torch）
+    # 2) 分后端执行
     if backend == "mlx":
-        print(f"后端：mlx（Apple Silicon / Metal）")
-        if audio_16k is None:
-            audio_16k = load_audio_16k(args.audio)
+        print("后端：mlx（Apple Silicon / Metal）")
         run_mlx_backend(args, audio_16k, saved_wav_path, source, stamp)
-        return
-
-    import torch  # noqa: F401
-
-    device = pick_device(args.device)
-    dtype = pick_dtype(args.dtype, device)
-    print(f"后端：{backend}，设备：{device}，精度：{str(dtype).replace('torch.', '')}")
-    if device == "cpu":
-        print("[提示] 未启用 MPS，正在使用 CPU，速度会明显偏慢。")
-
-    if backend == "transformers":
-        if audio_16k is None:
-            audio_16k = load_audio_16k(args.audio)
-        run_transformers_backend(args, audio_16k, device, dtype, saved_wav_path, source, stamp)
     else:
-        run_package_backend(args, audio_input, device, dtype, saved_wav_path, source, stamp)
+        device = pick_device(args.device)
+        dtype = pick_dtype(args.dtype, device)
+        print(f"后端：transformers，设备：{device}，精度：{str(dtype).replace('torch.', '')}")
+        if device == "cpu":
+            print("[提示] 未启用 MPS，正在使用 CPU，速度会明显偏慢。")
+        run_transformers_backend(args, audio_16k, device, dtype, saved_wav_path, source, stamp)
 
 
 if __name__ == "__main__":
