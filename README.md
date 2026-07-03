@@ -437,7 +437,15 @@ python scripts/record_and_transcribe.py --record --model ./models/Qwen3-ASR-0.6B
 ### 常见问题
 
 - **报错 `AttributeError: 'NoneType' object has no attribute 'get'`（`rope_scaling`）？** 这是把 `-hf` 模型喂给了 `qwen-asr` 包。用本仓库脚本时它会自动选原生 transformers 后端；若你手写代码，请对 `-hf` 模型用 `AutoModelForMultimodalLM`，不要用 `qwen_asr.Qwen3ASRModel`。
-- **报错找不到 `AutoModelForMultimodalLM` / `apply_transcription_request`？** transformers 版本太旧，缺少 Qwen3-ASR 原生支持。升级：`pip install -U transformers`（或 `pip install -U git+https://github.com/huggingface/transformers`）。
+- **报错找不到 `AutoModelForMultimodalLM` / `apply_transcription_request`，或日志出现 `Disabling PyTorch because PyTorch >= 2.4 is required`？** 这是 **PyTorch 版本太旧**（新版 transformers 需要 PyTorch ≥ 2.4，否则会禁用 PyTorch，导致模型无法加载、processor 缺少音频方法）。升级 PyTorch：
+
+  ```bash
+  pip install -U "torch>=2.4" torchaudio
+  ```
+
+  若升级后仍提示缺少原生支持，再升级 transformers：`pip install -U transformers`（或 `pip install -U git+https://github.com/huggingface/transformers`）。
+
+- **`qwen-asr 0.0.6 requires transformers==4.57.6 ... incompatible` 警告？** 用 `-hf` 模型走的是原生 transformers，不经过 `qwen-asr` 包，这条 pip 依赖冲突警告可以忽略（不影响 `-hf` 路线）。
 - **速度慢？** 确认日志里显示 `设备：mps`。首次运行需下载模型权重与做 MPS 预热，之后会明显变快。长音频会自动按 `--chunk-seconds` 分段处理，请耐心等待。
 - **报错 `sounddevice` / PortAudio 找不到设备？** 先 `brew install portaudio` 再 `pip install -U sounddevice`，并检查麦克风权限。
 - **MPS 上某个算子不支持报错？** 脚本已默认设置 `PYTORCH_ENABLE_MPS_FALLBACK=1` 让其回退到 CPU；仍报错可加 `--device cpu` 用纯 CPU 运行。

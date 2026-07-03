@@ -44,6 +44,7 @@
 import argparse
 import datetime as _dt
 import os
+import re
 import sys
 import tempfile
 import time
@@ -242,16 +243,42 @@ def write_outputs(args, text: str, language: str, timestamps: Optional[List[dict
 # ---------------------------------------------------------------------------
 # 后端 A：transformers 原生（-hf 模型）
 # ---------------------------------------------------------------------------
+def _ensure_torch_enabled_in_transformers() -> None:
+    """
+    新版 transformers 需要较新的 PyTorch（>= 2.4）。若 PyTorch 太旧，transformers 会
+    「禁用 PyTorch」，导致模型无法加载、processor 也缺少音频相关方法。这里给出精确报错。
+    """
+    import torch
+
+    try:
+        from transformers.utils import is_torch_available
+    except Exception:
+        is_torch_available = None
+
+    torch_ver = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+    disabled = (is_torch_available is not None) and (not is_torch_available())
+
+    if disabled or torch_ver < (2, 4):
+        raise SystemExit(
+            f"检测到 PyTorch {torch.__version__}，但当前 transformers 需要 PyTorch >= 2.4，"
+            "否则会禁用 PyTorch，导致 -hf 模型无法加载。\n\n"
+            "请升级 PyTorch（Apple Silicon 官方 wheel 已内置 MPS）：\n"
+            "    pip install -U 'torch>=2.4' torchaudio\n\n"
+            "升级后重新运行本脚本即可。"
+        )
+
+
 def _import_asr_model_class():
     import transformers
 
-    for name in ("AutoModelForMultimodalLM", "Qwen3ASRForConditionalGeneration"):
+    # 优先用显式类，避免 AutoModelForMultimodalLM 在某些版本上解析成空模型类型。
+    for name in ("Qwen3ASRForConditionalGeneration", "AutoModelForMultimodalLM"):
         cls = getattr(transformers, name, None)
         if cls is not None:
             return cls
     raise SystemExit(
-        "当前 transformers 版本没有 Qwen3-ASR 的原生支持（找不到 AutoModelForMultimodalLM / "
-        "Qwen3ASRForConditionalGeneration）。\n"
+        "当前 transformers 版本没有 Qwen3-ASR 的原生支持（找不到 Qwen3ASRForConditionalGeneration / "
+        "AutoModelForMultimodalLM）。\n"
         "使用 -hf 模型需要较新的 transformers，请升级：\n"
         "    pip install -U transformers\n"
         "或安装开发版：\n"
@@ -259,21 +286,59 @@ def _import_asr_model_class():
     )
 
 
+def _prepare_asr_inputs(processor, audio_path: str, language: Optional[str]):
+    """构造 ASR 模型输入；优先用 apply_transcription_request，缺失时回退到 chat template。"""
+    if hasattr(processor, "apply_transcription_request"):
+        return processor.apply_transcription_request(audio=audio_path, language=language)
+
+    # 回退：手动拼 chat template（兼容不同 transformers 版本）
+    messages = []
+    if language:
+        messages.append({"role": "system", "content": [{"type": "text", "text": language}]})
+    messages.append({"role": "user", "content": [{"type": "audio", "path": audio_path}]})
+    return processor.apply_chat_template(
+        [messages], tokenize=True, return_dict=True, add_generation_prompt=True,
+    )
+
+
+def _parse_raw_asr(raw: str, forced_language: Optional[str]) -> Tuple[str, str]:
+    """从原始解码文本里解析出 (language, text)，兼容 'language X<asr_text>...' 格式。"""
+    s = (raw or "").strip()
+    lang = forced_language or ""
+    text = s
+    if "<asr_text>" in s:
+        meta, text = s.split("<asr_text>", 1)
+        m = re.search(r"language\s+([A-Za-z]+)", meta)
+        if m and not lang:
+            lang = m.group(1)
+    # 去掉可能残留的特殊 token，如 <|im_end|> / <asr_text> 等
+    text = re.sub(r"<\|.*?\|>", "", text)
+    text = text.replace("<asr_text>", "").strip()
+    return lang, text
+
+
+def _decode_asr(processor, generated_ids, forced_language: Optional[str]) -> Tuple[str, str]:
+    """解码单条 ASR 输出，返回 (language, text)；优先用 return_format='parsed'。"""
+    try:
+        parsed = processor.decode(generated_ids, return_format="parsed")[0]
+        return (parsed.get("language") or forced_language or "",
+                (parsed.get("transcription") or "").strip())
+    except (TypeError, AttributeError, KeyError):
+        texts = processor.batch_decode(generated_ids, skip_special_tokens=False)
+        return _parse_raw_asr(texts[0] if texts else "", forced_language)
+
+
 def run_transformers_backend(args, audio_16k: np.ndarray, device: str, dtype,
                              saved_wav_path: Optional[str], source: Optional[str], stamp: str) -> None:
     import torch
     from transformers import AutoProcessor
 
+    _ensure_torch_enabled_in_transformers()
     asr_cls = _import_asr_model_class()
 
     print(f"正在加载 transformers 原生模型：{args.model}（首次运行会自动下载权重，请耐心等待）……")
     t0 = time.time()
     processor = AutoProcessor.from_pretrained(args.model)
-    if not hasattr(processor, "apply_transcription_request"):
-        raise SystemExit(
-            "processor 缺少 apply_transcription_request，说明 transformers 版本过旧，无法使用 -hf 模型。\n"
-            "请升级：pip install -U transformers（或 git+https://github.com/huggingface/transformers）。"
-        )
     model = asr_cls.from_pretrained(args.model, dtype=dtype)
     model.to(device)
     model.eval()
@@ -309,15 +374,13 @@ def run_transformers_backend(args, audio_16k: np.ndarray, device: str, dtype,
         try:
             save_wav(chunk, tmp_path)
 
-            inputs = processor.apply_transcription_request(audio=tmp_path, language=args.language)
+            inputs = _prepare_asr_inputs(processor, tmp_path, args.language)
             inputs = inputs.to(model.device, model.dtype)
             with torch.inference_mode():
                 output_ids = model.generate(**inputs, max_new_tokens=args.max_new_tokens)
             generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
-            parsed = processor.decode(generated_ids, return_format="parsed")[0]
+            lang, text = _decode_asr(processor, generated_ids, args.language)
 
-            text = (parsed.get("transcription") or "").strip()
-            lang = parsed.get("language") or ""
             if text:
                 all_text.append(text)
             if lang:

@@ -92,8 +92,9 @@ python -m pip install -U pip wheel
 # 4. 安装 Python 依赖
 # ---------------------------------------------------------------------------
 # PyTorch 在 macOS 上的官方 wheel 已内置 MPS（Metal）后端，直接 pip 安装即可。
-info "安装 PyTorch（含 Apple Silicon MPS 支持）……"
-python -m pip install -U torch torchaudio
+# 新版 transformers 需要 PyTorch >= 2.4，否则会禁用 PyTorch 导致模型无法加载。
+info "安装 PyTorch >= 2.4（含 Apple Silicon MPS 支持）……"
+python -m pip install -U "torch>=2.4" torchaudio
 
 if [[ "${USE_HF}" == "1" ]]; then
   info "安装 transformers（-hf 模型的原生支持）……"
