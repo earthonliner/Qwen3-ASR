@@ -67,16 +67,30 @@ brew install ffmpeg sox portaudio || warn "部分 brew 包安装失败，如果�
 # ---------------------------------------------------------------------------
 # 3. Python 环境（优先 conda，否则退回 python3 -m venv）
 # ---------------------------------------------------------------------------
+# 在 Apple Silicon 上强制创建 arm64 原生环境；否则 PyTorch 只能到 2.2.2（Intel 最后一版），
+# 会导致新版 transformers 因 torch<2.4 而禁用 PyTorch，模型无法加载。
+CONDA_SUBDIR_ENV=""
+if [[ "$ARCH" == "arm64" ]]; then
+  CONDA_SUBDIR_ENV="osx-arm64"
+fi
+
 if command -v conda >/dev/null 2>&1; then
-  info "使用 conda 创建 Python ${PYTHON_VERSION} 环境：${ENV_NAME}"
+  info "使用 conda 创建 Python ${PYTHON_VERSION} 环境：${ENV_NAME}（arch=${ARCH}）"
   # shellcheck disable=SC1091
   source "$(conda info --base)/etc/profile.d/conda.sh"
   if ! conda env list | grep -qE "^${ENV_NAME}\s"; then
-    conda create -n "${ENV_NAME}" "python=${PYTHON_VERSION}" -y
+    if [[ -n "$CONDA_SUBDIR_ENV" ]]; then
+      CONDA_SUBDIR="$CONDA_SUBDIR_ENV" conda create -n "${ENV_NAME}" "python=${PYTHON_VERSION}" -y
+    else
+      conda create -n "${ENV_NAME}" "python=${PYTHON_VERSION}" -y
+    fi
   else
     info "conda 环境 ${ENV_NAME} 已存在，跳过创建。"
   fi
   conda activate "${ENV_NAME}"
+  if [[ -n "$CONDA_SUBDIR_ENV" ]]; then
+    conda config --env --set subdir "$CONDA_SUBDIR_ENV" || true
+  fi
   ACTIVATE_HINT="conda activate ${ENV_NAME}"
 else
   warn "未检测到 conda，改用 python3 -m venv 创建虚拟环境 .venv-${ENV_NAME}"
@@ -87,6 +101,16 @@ else
 fi
 
 python -m pip install -U pip wheel
+
+# 校验环境是否为 arm64 原生（Apple Silicon）。x86_64 会导致 torch 卡在 2.2.2。
+PY_MACHINE="$(python -c 'import platform; print(platform.machine())')"
+info "Python 架构：${PY_MACHINE}"
+if [[ "$ARCH" == "arm64" && "$PY_MACHINE" == "x86_64" ]]; then
+  error "当前 Python 是 x86_64（Intel/Rosetta），无法安装 PyTorch>=2.4。"
+  error "请安装原生 arm64 的 conda（推荐 Miniforge：brew install miniforge）后重试，"
+  error "或手动创建原生环境：CONDA_SUBDIR=osx-arm64 conda create -n ${ENV_NAME} python=${PYTHON_VERSION} -y"
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # 4. 安装 Python 依赖

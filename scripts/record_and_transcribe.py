@@ -259,12 +259,27 @@ def _ensure_torch_enabled_in_transformers() -> None:
     disabled = (is_torch_available is not None) and (not is_torch_available())
 
     if disabled or torch_ver < (2, 4):
+        import platform
+
+        arch_hint = ""
+        if platform.system() == "Darwin" and platform.machine() == "x86_64":
+            arch_hint = (
+                "\n\n⚠️ 检测到当前 Python 是 x86_64（Intel / Rosetta）架构！\n"
+                "   PyTorch 在 macOS 上最后的 Intel 版本就是 2.2.2，所以 pip 找不到 >=2.4，\n"
+                "   这几乎肯定是因为你的 conda/Python 环境不是 Apple Silicon 原生（arm64）。\n"
+                "   需要新建一个原生 arm64 环境（示例）：\n"
+                "       CONDA_SUBDIR=osx-arm64 conda create -n qwen3-asr-arm python=3.12 -y\n"
+                "       conda activate qwen3-asr-arm\n"
+                "       conda config --env --set subdir osx-arm64\n"
+                "       python -c \"import platform; print(platform.machine())\"   # 应显示 arm64\n"
+                "   然后重新安装依赖：pip install -U 'torch>=2.4' torchaudio transformers ..."
+            )
         raise SystemExit(
             f"检测到 PyTorch {torch.__version__}，但当前 transformers 需要 PyTorch >= 2.4，"
             "否则会禁用 PyTorch，导致 -hf 模型无法加载。\n\n"
-            "请升级 PyTorch（Apple Silicon 官方 wheel 已内置 MPS）：\n"
-            "    pip install -U 'torch>=2.4' torchaudio\n\n"
-            "升级后重新运行本脚本即可。"
+            "请升级 PyTorch（Apple Silicon 原生 wheel 已内置 MPS）：\n"
+            "    pip install -U 'torch>=2.4' torchaudio"
+            f"{arch_hint}\n\n升级后重新运行本脚本即可。"
         )
 
 

@@ -445,6 +445,24 @@ python scripts/record_and_transcribe.py --record --model ./models/Qwen3-ASR-0.6B
 
   若升级后仍提示缺少原生支持，再升级 transformers：`pip install -U transformers`（或 `pip install -U git+https://github.com/huggingface/transformers`）。
 
+- **`pip install "torch>=2.4"` 报 `Could not find a version that satisfies the requirement torch>=2.4 (from versions: 2.2.0, 2.2.1, 2.2.2)`？** 说明你的 conda/Python 是 **x86_64（Intel/Rosetta）** 架构——PyTorch 在 macOS 上最后的 Intel 版本就是 2.2.2，Apple Silicon 原生（arm64）才有 2.4+。先确认：
+
+  ```bash
+  python -c "import platform; print(platform.machine())"   # 若显示 x86_64 即为此问题
+  ```
+
+  新建一个**原生 arm64 环境**再安装（从现有 miniconda 即可，无需重装 conda）：
+
+  ```bash
+  CONDA_SUBDIR=osx-arm64 conda create -n qwen3-asr-arm python=3.12 -y
+  conda activate qwen3-asr-arm
+  conda config --env --set subdir osx-arm64
+  python -c "import platform; print(platform.machine())"   # 现在应为 arm64
+  pip install -U "torch>=2.4" torchaudio transformers accelerate librosa soundfile sounddevice nagisa soynlp
+  ```
+
+  或安装原生 arm64 的 Miniforge：`brew install miniforge`，再 `conda init "$(basename "$SHELL")"` 并重开终端。
+
 - **`qwen-asr 0.0.6 requires transformers==4.57.6 ... incompatible` 警告？** 用 `-hf` 模型走的是原生 transformers，不经过 `qwen-asr` 包，这条 pip 依赖冲突警告可以忽略（不影响 `-hf` 路线）。
 - **速度慢？** 确认日志里显示 `设备：mps`。首次运行需下载模型权重与做 MPS 预热，之后会明显变快。长音频会自动按 `--chunk-seconds` 分段处理，请耐心等待。
 - **报错 `sounddevice` / PortAudio 找不到设备？** 先 `brew install portaudio` 再 `pip install -U sounddevice`，并检查麦克风权限。
