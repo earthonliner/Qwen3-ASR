@@ -17,22 +17,25 @@
 在 Apple Silicon Mac（如 MacBook Air M2 / 16GB）上，用 Qwen3-ASR-0.6B 录制并转写
 课堂上老师与学生的对话。
 
-支持两套模型/后端，脚本会根据模型名自动选择：
+支持三套模型/后端，脚本会根据模型名自动选择：
 
-1) transformers 原生版（推荐给带 -hf 后缀的仓库，如 Qwen/Qwen3-ASR-0.6B-hf）
+1) MLX 版（Apple Silicon 上最快，推荐；模型名含 mlx，如 mlx-community/Qwen3-ASR-0.6B-8bit）
+   - 用 mlx-audio：pip install mlx-audio
+
+2) transformers 原生版（带 -hf 后缀的仓库，如 Qwen/Qwen3-ASR-0.6B-hf）
    - 用 🤗 transformers 原生的 AutoModelForMultimodalLM + processor.apply_transcription_request
    - 需要较新的 transformers（含 Qwen3-ASR 原生支持）
 
-2) qwen-asr 包版（用于不带 -hf 的仓库，如 Qwen/Qwen3-ASR-0.6B）
+3) qwen-asr 包版（不带 -hf 的仓库，如 Qwen/Qwen3-ASR-0.6B）
    - 用 qwen_asr.Qwen3ASRModel
 
 两种使用方式：
 
    # 现场录音后转写（讲课过程中运行，结束时按 Ctrl+C 停止录音）
-   python scripts/record_and_transcribe.py --record --model Qwen/Qwen3-ASR-0.6B-hf --timestamps
+   python scripts/record_and_transcribe.py --record --model mlx-community/Qwen3-ASR-0.6B-8bit --timestamps
 
    # 转写一个已有的音频/视频文件（wav / mp3 / m4a / mp4 …，需已安装 ffmpeg）
-   python scripts/record_and_transcribe.py --audio ./lesson.m4a --model Qwen/Qwen3-ASR-0.6B-hf --language Chinese
+   python scripts/record_and_transcribe.py --audio ./lesson.m4a --model mlx-community/Qwen3-ASR-1.7B-4bit --language Chinese
 
 说明：
 - macOS 上通过 MPS(Metal) 做 GPU 加速；vLLM 在 macOS 上不可用。
@@ -62,10 +65,18 @@ SAMPLE_RATE = 16000  # Qwen3-ASR 使用 16kHz 单声道输入
 # 后端 / 设备 / 精度选择
 # ---------------------------------------------------------------------------
 def resolve_backend(backend: str, model_name: str) -> str:
-    """auto 时：带 -hf 后缀走 transformers 原生后端，否则走 qwen-asr 包后端。"""
+    """
+    auto 时按模型名判断：
+      - 名字里含 mlx（如 mlx-community/...、Qwen3-ASR-0.6B-8bit-mlx）→ mlx 后端
+      - 带 -hf 后缀 → transformers 原生后端
+      - 其余 → qwen-asr 包后端
+    """
     if backend != "auto":
         return backend
-    base = os.path.basename(str(model_name).rstrip("/"))
+    name = str(model_name).rstrip("/")
+    base = os.path.basename(name)
+    if "mlx" in name.lower():
+        return "mlx"
     return "transformers" if base.endswith("-hf") else "package"
 
 
@@ -238,6 +249,118 @@ def write_outputs(args, text: str, language: str, timestamps: Optional[List[dict
     print(f"\n转写文本已保存到：{out_path}")
     if args.timestamps and timestamps:
         print("（文件中包含逐词/逐字时间戳，可按时间顺序回看老师与学生的对话。）")
+
+
+# ---------------------------------------------------------------------------
+# 后端 A0：MLX（mlx-community 模型，Apple Silicon 最快）
+# ---------------------------------------------------------------------------
+def _load_mlx_model(model_path: str):
+    """加载 mlx-audio 的 STT 模型，兼容不同版本的入口。"""
+    try:
+        try:
+            from mlx_audio.stt.utils import load_model as _load
+        except ImportError:
+            from mlx_audio.stt import load as _load
+    except ImportError as e:
+        raise SystemExit(
+            "缺少 mlx-audio，无法使用 MLX 后端。请安装：\n"
+            "    pip install -U mlx-audio\n"
+            "（仅支持 Apple Silicon 的 macOS。）\n"
+            f"原始错误：{e}"
+        )
+    return _load(model_path)
+
+
+def _mlx_generate_kwargs(model, language: Optional[str], max_tokens: int) -> dict:
+    """按 model.generate 的实际签名过滤 kwargs，兼容不同 mlx-audio 版本。"""
+    import inspect
+
+    candidates = {"language": language, "max_tokens": max_tokens}
+    try:
+        params = inspect.signature(model.generate).parameters
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        return {k: v for k, v in candidates.items()
+                if v is not None and (has_var_kw or k in params)}
+    except (TypeError, ValueError):
+        return {k: v for k, v in candidates.items() if v is not None}
+
+
+def run_mlx_backend(args, audio_16k: np.ndarray,
+                    saved_wav_path: Optional[str], source: Optional[str], stamp: str) -> None:
+    print(f"正在加载 MLX 模型：{args.model}（首次运行会自动下载权重，请耐心等待）……")
+    t0 = time.time()
+    model = _load_mlx_model(args.model)
+
+    aligner = None
+    if args.timestamps:
+        print(f"正在加载 MLX 对齐模型：{args.aligner} ……")
+        aligner = _load_mlx_model(args.aligner)
+    print(f"模型加载完成，用时 {time.time() - t0:.1f} 秒。开始转写……")
+
+    chunks = split_fixed(audio_16k, args.chunk_seconds)
+    if len(chunks) > 1:
+        print(f"音频较长，已按 {args.chunk_seconds:.0f} 秒切成 {len(chunks)} 段处理。")
+
+    all_text: List[str] = []
+    all_lang: List[str] = []
+    all_ts: List[dict] = []
+
+    t0 = time.time()
+    for idx, (chunk, offset) in enumerate(chunks):
+        if len(chunks) > 1:
+            print(f"\r正在转写第 {idx + 1}/{len(chunks)} 段……", end="", flush=True)
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        try:
+            save_wav(chunk, tmp_path)
+
+            gen_kwargs = _mlx_generate_kwargs(model, args.language, args.max_new_tokens)
+            result = model.generate(tmp_path, **gen_kwargs)
+            lang, text = _parse_raw_asr(getattr(result, "text", "") or "", args.language)
+
+            if text:
+                all_text.append(text)
+            if lang:
+                all_lang.append(lang)
+
+            if args.timestamps and text and aligner is not None:
+                try:
+                    align_kwargs = {"text": text}
+                    if lang or args.language:
+                        align_kwargs["language"] = lang or args.language
+                    align_result = aligner.generate(tmp_path, **align_kwargs)
+                    for item in align_result:
+                        all_ts.append({
+                            "text": item.text,
+                            "start_time": float(item.start_time) + offset,
+                            "end_time": float(item.end_time) + offset,
+                        })
+                except Exception as e:
+                    print(f"\n[对齐警告] 本段时间戳计算失败，已跳过：{e}", file=sys.stderr)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    if len(chunks) > 1:
+        print()
+    print(f"转写完成，用时 {time.time() - t0:.1f} 秒。\n")
+
+    merged_lang: List[str] = []
+    for l in all_lang:
+        if l and (not merged_lang or merged_lang[-1] != l):
+            merged_lang.append(l)
+
+    write_outputs(
+        args,
+        text=" ".join(all_text).strip(),
+        language=",".join(merged_lang),
+        timestamps=all_ts if args.timestamps else None,
+        saved_wav_path=saved_wav_path,
+        source=source,
+        stamp=stamp,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -551,9 +674,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--duration", type=float, default=None,
                    help="录音模式下的最长录制秒数；不填则一直录到 Ctrl+C。")
     p.add_argument("--model", type=str, default="Qwen/Qwen3-ASR-0.6B-hf",
-                   help="ASR 模型名或本地目录。带 -hf 用 transformers 原生后端，不带 -hf 用 qwen-asr 包后端。")
-    p.add_argument("--backend", type=str, default="auto", choices=["auto", "transformers", "package"],
-                   help="推理后端；auto 会根据模型名是否带 -hf 自动选择。")
+                   help="ASR 模型名或本地目录。名字含 mlx 用 MLX 后端（最快），带 -hf 用 transformers "
+                        "原生后端，其余用 qwen-asr 包后端。")
+    p.add_argument("--backend", type=str, default="auto",
+                   choices=["auto", "mlx", "transformers", "package"],
+                   help="推理后端；auto 会根据模型名自动选择（含 mlx → mlx，-hf → transformers）。")
     p.add_argument("--language", type=str, default=None,
                    help="强制识别语言（如 Chinese / English，或 zh / en）；不填则自动检测，适合中英混说的课堂。")
     p.add_argument("--timestamps", action="store_true",
@@ -569,7 +694,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-new-tokens", type=int, default=1024,
                    help="每段最多生成的 token 数；课堂长音频建议设大一些。")
     p.add_argument("--chunk-seconds", type=float, default=30.0,
-                   help="transformers 后端处理长音频时的分段时长（秒）。qwen-asr 后端会自行分段，忽略该值。")
+                   help="mlx / transformers 后端处理长音频时的分段时长（秒）。qwen-asr 后端会自行分段，忽略该值。")
     p.add_argument("--output-dir", type=str, default="./recordings",
                    help="录音与转写结果的保存目录。")
     p.add_argument("--output", type=str, default=None,
@@ -582,12 +707,12 @@ def main() -> None:
 
     backend = resolve_backend(args.backend, args.model)
 
-    # 自动选择对齐模型版本，与后端保持一致（-hf 配 -hf）。
+    # 自动选择对齐模型版本，与后端保持一致（mlx 配 mlx，-hf 配 -hf）。
     if args.aligner is None:
-        args.aligner = (
-            "Qwen/Qwen3-ForcedAligner-0.6B-hf" if backend == "transformers"
-            else "Qwen/Qwen3-ForcedAligner-0.6B"
-        )
+        args.aligner = {
+            "mlx": "mlx-community/Qwen3-ForcedAligner-0.6B-8bit",
+            "transformers": "Qwen/Qwen3-ForcedAligner-0.6B-hf",
+        }.get(backend, "Qwen/Qwen3-ForcedAligner-0.6B")
 
     os.makedirs(args.output_dir, exist_ok=True)
     stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -606,14 +731,21 @@ def main() -> None:
         audio_input = (audio_16k, SAMPLE_RATE)
     else:
         is_url = str(args.audio).startswith(("http://", "https://"))
-        if backend == "transformers" and is_url:
-            raise SystemExit("transformers 后端仅支持本地文件；请先把音频下载到本地，再用 --audio 指向它。")
+        if backend in ("transformers", "mlx") and is_url:
+            raise SystemExit(f"{backend} 后端仅支持本地文件；请先把音频下载到本地，再用 --audio 指向它。")
         if not is_url and not os.path.exists(args.audio):
             raise SystemExit(f"找不到音频文件：{args.audio}")
         source = args.audio
         audio_input = args.audio  # qwen-asr 后端可直接吃路径 / URL
 
-    # 2) 设备 / 精度
+    # 2) 分后端执行（MLX 自行管理设备，无需 torch）
+    if backend == "mlx":
+        print(f"后端：mlx（Apple Silicon / Metal）")
+        if audio_16k is None:
+            audio_16k = load_audio_16k(args.audio)
+        run_mlx_backend(args, audio_16k, saved_wav_path, source, stamp)
+        return
+
     import torch  # noqa: F401
 
     device = pick_device(args.device)
@@ -622,7 +754,6 @@ def main() -> None:
     if device == "cpu":
         print("[提示] 未启用 MPS，正在使用 CPU，速度会明显偏慢。")
 
-    # 3) 分后端执行
     if backend == "transformers":
         if audio_16k is None:
             audio_16k = load_audio_16k(args.audio)

@@ -13,6 +13,7 @@
 #
 # 用法：
 #   bash scripts/setup_mac.sh                     # 默认安装（-hf / 原生 transformers）
+#   USE_MLX=1 bash scripts/setup_mac.sh           # 安装 MLX 后端（Apple Silicon 最快，推荐）
 #   USE_HF=0 bash scripts/setup_mac.sh            # 改用非 -hf 的 qwen-asr 包版本
 #   USE_MODELSCOPE=1 bash scripts/setup_mac.sh    # 额外用 ModelScope 预下载模型（推荐国内用户）
 #   ENV_NAME=my-asr bash scripts/setup_mac.sh     # 自定义 conda 环境名
@@ -21,11 +22,15 @@ set -euo pipefail
 
 ENV_NAME="${ENV_NAME:-qwen3-asr}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
+USE_MLX="${USE_MLX:-0}"               # 1=使用 MLX（mlx-audio，Apple Silicon 最快）
 USE_HF="${USE_HF:-1}"                 # 1=使用 -hf 原生 transformers；0=使用 qwen-asr 包
 USE_MODELSCOPE="${USE_MODELSCOPE:-0}"
 MODEL_DIR="${MODEL_DIR:-./models}"
 
-if [[ "${USE_HF}" == "1" ]]; then
+if [[ "${USE_MLX}" == "1" ]]; then
+  MODEL_ID="${MODEL_ID:-mlx-community/Qwen3-ASR-0.6B-8bit}"
+  ALIGNER_ID="${ALIGNER_ID:-mlx-community/Qwen3-ForcedAligner-0.6B-8bit}"
+elif [[ "${USE_HF}" == "1" ]]; then
   MODEL_ID="${MODEL_ID:-Qwen/Qwen3-ASR-0.6B-hf}"
   ALIGNER_ID="${ALIGNER_ID:-Qwen/Qwen3-ForcedAligner-0.6B-hf}"
 else
@@ -117,6 +122,16 @@ fi
 # ---------------------------------------------------------------------------
 # PyTorch 在 macOS 上的官方 wheel 已内置 MPS（Metal）后端，直接 pip 安装即可。
 # 新版 transformers 需要 PyTorch >= 2.4，否则会禁用 PyTorch 导致模型无法加载。
+if [[ "${USE_MLX}" == "1" ]]; then
+  info "安装 MLX 后端（mlx-audio，Apple Silicon 最快）……"
+  python -m pip install -U mlx-audio
+  info "安装音频处理与网页工具依赖（librosa / soundfile / flask）……"
+  python -m pip install -U librosa soundfile flask
+  info "安装录音依赖 sounddevice……"
+  python -m pip install -U sounddevice
+  # MLX 后端不需要 PyTorch / transformers，直接跳到模型下载环节
+else
+
 info "安装 PyTorch >= 2.4（含 Apple Silicon MPS 支持）……"
 python -m pip install -U "torch>=2.4" torchaudio
 
@@ -143,12 +158,18 @@ fi
 info "安装录音依赖 sounddevice……"
 python -m pip install -U sounddevice
 
+fi  # USE_MLX
+
 # 注意：vLLM / flash-attn 不支持 macOS，切勿在 Mac 上安装它们。
 
 # ---------------------------------------------------------------------------
 # 5. 可选：用 ModelScope 预下载模型（国内网络更快）
 # ---------------------------------------------------------------------------
 if [[ "${USE_MODELSCOPE}" == "1" ]]; then
+  if [[ "${USE_MLX}" == "1" ]]; then
+    warn "mlx-community 模型主要发布在 HuggingFace；若 ModelScope 上没有同名仓库，下载会失败。"
+    warn "失败时请改用：HF_ENDPOINT=https://hf-mirror.com huggingface-cli download ${MODEL_ID} --local-dir ${MODEL_DIR}/$(basename "${MODEL_ID}")"
+  fi
   info "使用 ModelScope 预下载模型到 ${MODEL_DIR} ……"
   python -m pip install -U modelscope
   mkdir -p "${MODEL_DIR}"
