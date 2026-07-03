@@ -133,8 +133,8 @@ if [[ "${USE_HF}" == "1" ]]; then
     warn "当前 transformers 仍不认识 qwen3_asr；如仍报错，请确认已安装源码开发版："
     warn "    pip install -U 'git+https://github.com/huggingface/transformers'"
   fi
-  info "安装音频处理依赖（librosa / soundfile / nagisa / soynlp）……"
-  python -m pip install -U librosa soundfile nagisa soynlp
+  info "安装音频处理与网页工具依赖（librosa / soundfile / nagisa / soynlp / flask）……"
+  python -m pip install -U librosa soundfile nagisa soynlp flask
 else
   info "安装 qwen-asr（非 -hf 的包版本）……"
   python -m pip install -U qwen-asr

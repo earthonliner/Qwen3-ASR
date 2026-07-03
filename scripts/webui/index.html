@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qwen3-ASR 课堂转写</title>
+<style>
+  :root {
+    --bg: #f4f6fb;
+    --card: #ffffff;
+    --border: #e3e8f0;
+    --text: #1c2333;
+    --muted: #6b7280;
+    --primary: #4f46e5;
+    --primary-hover: #4338ca;
+    --danger: #dc2626;
+    --danger-hover: #b91c1c;
+    --ok: #059669;
+    --partial: #9333ea;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", sans-serif;
+    background: var(--bg); color: var(--text);
+    min-height: 100vh; padding: 32px 16px 64px;
+  }
+  .container { max-width: 860px; margin: 0 auto; }
+  header { text-align: center; margin-bottom: 28px; }
+  header h1 { font-size: 26px; font-weight: 700; letter-spacing: 0.5px; }
+  header p { color: var(--muted); margin-top: 6px; font-size: 14px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 22px 24px; margin-bottom: 20px;
+    box-shadow: 0 1px 3px rgba(16, 24, 40, .06);
+  }
+  .card h2 { font-size: 17px; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+  .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  label { font-size: 13px; color: var(--muted); }
+  select, input[type=file] {
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+    font-size: 14px; background: #fff; color: var(--text);
+  }
+  button {
+    border: none; border-radius: 10px; padding: 10px 22px;
+    font-size: 15px; font-weight: 600; cursor: pointer;
+    background: var(--primary); color: #fff; transition: background .15s;
+    display: inline-flex; align-items: center; gap: 8px;
+  }
+  button:hover { background: var(--primary-hover); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.recording { background: var(--danger); }
+  button.recording:hover { background: var(--danger-hover); }
+  button.secondary { background: #eef0f6; color: var(--text); }
+  button.secondary:hover { background: #e2e5ee; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: currentColor; }
+  .blink { animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: .25; } }
+  .status { font-size: 13px; color: var(--muted); min-height: 18px; margin-top: 10px; }
+  .transcript {
+    margin-top: 14px; border: 1px solid var(--border); border-radius: 10px;
+    background: #fafbfe; padding: 14px 16px; min-height: 110px; max-height: 340px;
+    overflow-y: auto; font-size: 15px; line-height: 1.9; white-space: pre-wrap; word-break: break-word;
+  }
+  .transcript .partial { color: var(--partial); }
+  .transcript .placeholder { color: #b6bcc9; }
+  .meta { font-size: 12px; color: var(--muted); margin-top: 8px; display: flex; gap: 18px; flex-wrap: wrap; }
+  .saved a { color: var(--primary); text-decoration: none; }
+  .saved a:hover { text-decoration: underline; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 12.5px; }
+  td a { color: var(--primary); text-decoration: none; }
+  td a:hover { text-decoration: underline; }
+  .empty { color: #b6bcc9; font-size: 14px; padding: 12px 4px; }
+  .spinner {
+    width: 15px; height: 15px; border: 2px solid rgba(255,255,255,.4);
+    border-top-color: #fff; border-radius: 50%; animation: spin .8s linear infinite;
+  }
+  .spinner.dark { border-color: rgba(0,0,0,.15); border-top-color: var(--primary); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .hint { font-size: 12.5px; color: var(--muted); margin-top: 10px; line-height: 1.7; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Qwen3-ASR 课堂转写</h1>
+    <p>本地运行 · 录音准实时转写 · 文件上传转写 · 自动保存</p>
+  </header>
+
+  <!-- 录音转写 -->
+  <div class="card">
+    <h2>录音转写</h2>
+    <div class="row">
+      <label>语言
+        <select id="live-lang">
+          <option value="">自动检测</option>
+          <option value="Chinese">中文</option>
+          <option value="English">English</option>
+          <option value="Cantonese">粤语</option>
+          <option value="Japanese">日本語</option>
+          <option value="Korean">한국어</option>
+        </select>
+      </label>
+      <button id="rec-btn"><span class="dot"></span><span id="rec-btn-text">开始录音</span></button>
+      <span id="rec-timer" style="font-variant-numeric: tabular-nums; font-size: 14px; color: var(--muted);"></span>
+    </div>
+    <div class="transcript" id="live-transcript"><span class="placeholder">点击「开始录音」，对着麦克风讲课，文字会在这里逐段刷新……</span></div>
+    <div class="meta">
+      <span id="live-lang-detected"></span>
+      <span class="saved" id="live-saved"></span>
+    </div>
+    <div class="status" id="live-status"></div>
+    <div class="hint">紫色文字为当前段落的临时结果，会随录音继续而修正；黑色为已固化文本。停止录音后自动保存 wav 与 txt 到服务器 recordings 目录。</div>
+  </div>
+
+  <!-- 文件转写 -->
+  <div class="card">
+    <h2>上传文件转写</h2>
+    <div class="row">
+      <label>语言
+        <select id="file-lang">
+          <option value="">自动检测</option>
+          <option value="Chinese">中文</option>
+          <option value="English">English</option>
+          <option value="Cantonese">粤语</option>
+          <option value="Japanese">日本語</option>
+          <option value="Korean">한국어</option>
+        </select>
+      </label>
+      <input type="file" id="file-input" accept="audio/*,video/*,.wav,.mp3,.m4a,.mp4,.flac,.ogg,.aac,.webm">
+      <button id="upload-btn">开始转写</button>
+    </div>
+    <div class="transcript" id="file-transcript"><span class="placeholder">选择音频/视频文件后点击「开始转写」……</span></div>
+    <div class="meta">
+      <span id="file-meta"></span>
+      <span class="saved" id="file-saved"></span>
+    </div>
+    <div class="status" id="file-status"></div>
+  </div>
+
+  <!-- 历史记录 -->
+  <div class="card">
+    <h2>历史记录 <button class="secondary" id="refresh-btn" style="margin-left:auto; padding:6px 14px; font-size:13px;">刷新</button></h2>
+    <div id="history-box"><div class="empty">加载中……</div></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+const SR = 16000;
+const CHUNK_MS = 3000;   // 每 3 秒上传一次音频块
+
+// ---------------- 录音 ----------------
+let mediaStream = null, audioCtx = null, procNode = null, srcNode = null;
+let sessionId = null, recording = false, pending = [];
+let sendTimer = null, clockTimer = null, startTs = 0, inflight = false;
+
+const recBtn = document.getElementById("rec-btn");
+const recBtnText = document.getElementById("rec-btn-text");
+const recTimer = document.getElementById("rec-timer");
+const liveTranscript = document.getElementById("live-transcript");
+const liveStatus = document.getElementById("live-status");
+const liveLangDetected = document.getElementById("live-lang-detected");
+const liveSaved = document.getElementById("live-saved");
+
+recBtn.addEventListener("click", () => recording ? stopRecording() : startRecording());
+
+async function startRecording() {
+  liveStatus.textContent = ""; liveSaved.textContent = ""; liveLangDetected.textContent = "";
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+  } catch (e) {
+    liveStatus.textContent = "无法访问麦克风：" + e.message + "（请在浏览器/系统设置里授权）";
+    return;
+  }
+
+  const resp = await fetch("/api/session/start", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ language: document.getElementById("live-lang").value }),
+  });
+  sessionId = (await resp.json()).session_id;
+
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  srcNode = audioCtx.createMediaStreamSource(mediaStream);
+  procNode = audioCtx.createScriptProcessor(4096, 1, 1);
+  const ratio = audioCtx.sampleRate / SR;
+
+  procNode.onaudioprocess = (ev) => {
+    if (!recording) return;
+    const input = ev.inputBuffer.getChannelData(0);
+    // 简单抽取式降采样到 16k
+    const outLen = Math.floor(input.length / ratio);
+    const out = new Int16Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      let v = input[Math.floor(i * ratio)];
+      v = Math.max(-1, Math.min(1, v));
+      out[i] = v < 0 ? v * 0x8000 : v * 0x7FFF;
+    }
+    pending.push(out);
+  };
+  srcNode.connect(procNode);
+  procNode.connect(audioCtx.destination);
+
+  recording = true;
+  startTs = Date.now();
+  recBtn.classList.add("recording");
+  recBtn.querySelector(".dot").classList.add("blink");
+  recBtnText.textContent = "停止录音";
+  liveTranscript.innerHTML = '<span class="placeholder">正在聆听……</span>';
+
+  sendTimer = setInterval(flushChunk, CHUNK_MS);
+  clockTimer = setInterval(() => {
+    const s = Math.floor((Date.now() - startTs) / 1000);
+    recTimer.textContent = String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
+  }, 500);
+}
+
+function takePending() {
+  if (pending.length === 0) return null;
+  let total = 0; pending.forEach(a => total += a.length);
+  const merged = new Int16Array(total);
+  let off = 0; pending.forEach(a => { merged.set(a, off); off += a.length; });
+  pending = [];
+  return merged;
+}
+
+async function flushChunk() {
+  if (!sessionId || inflight) return;
+  const merged = takePending();
+  if (!merged || merged.length === 0) return;
+  inflight = true;
+  try {
+    const resp = await fetch(`/api/session/${sessionId}/chunk`, {
+      method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: merged.buffer,
+    });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const data = await resp.json();
+    renderLive(data.final_text, data.partial_text);
+    if (data.language) liveLangDetected.textContent = "语言：" + data.language;
+  } catch (e) {
+    liveStatus.textContent = "转写请求失败：" + e.message;
+  } finally {
+    inflight = false;
+  }
+}
+
+function renderLive(finalText, partialText) {
+  if (!finalText && !partialText) return;
+  const esc = (t) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  liveTranscript.innerHTML = esc(finalText || "") +
+    (partialText ? ' <span class="partial">' + esc(partialText) + "</span>" : "");
+  liveTranscript.scrollTop = liveTranscript.scrollHeight;
+}
+
+async function stopRecording() {
+  recording = false;
+  clearInterval(sendTimer); clearInterval(clockTimer);
+  recBtn.disabled = true; recBtnText.textContent = "处理中…";
+  recBtn.classList.remove("recording");
+  recBtn.querySelector(".dot").classList.remove("blink");
+
+  try { procNode && procNode.disconnect(); srcNode && srcNode.disconnect(); } catch (e) {}
+  try { mediaStream && mediaStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  try { audioCtx && audioCtx.close(); } catch (e) {}
+
+  // 把剩余音频发完，再 stop
+  liveStatus.textContent = "正在转写最后一段并保存……";
+  try {
+    const merged = takePending();
+    if (merged && merged.length > 0 && sessionId) {
+      await fetch(`/api/session/${sessionId}/chunk`, {
+        method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: merged.buffer,
+      });
+    }
+    const resp = await fetch(`/api/session/${sessionId}/stop`, { method: "POST" });
+    const data = await resp.json();
+    renderLive(data.final_text, "");
+    if (data.language) liveLangDetected.textContent = "语言：" + data.language;
+    let savedHtml = "";
+    if (data.saved && data.saved.transcript)
+      savedHtml += `已保存：<a href="/files/${encodeURIComponent(data.saved.transcript)}" target="_blank">${data.saved.transcript}</a>`;
+    if (data.saved && data.saved.audio)
+      savedHtml += ` · <a href="/files/${encodeURIComponent(data.saved.audio)}" target="_blank">${data.saved.audio}</a>`;
+    liveSaved.innerHTML = savedHtml;
+    liveStatus.textContent = data.final_text ? "转写完成。" : "没有识别到语音内容。";
+    loadHistory();
+  } catch (e) {
+    liveStatus.textContent = "停止时出错：" + e.message;
+  } finally {
+    sessionId = null;
+    recBtn.disabled = false; recBtnText.textContent = "开始录音";
+    recTimer.textContent = "";
+  }
+}
+
+// ---------------- 文件上传 ----------------
+const uploadBtn = document.getElementById("upload-btn");
+const fileInput = document.getElementById("file-input");
+const fileTranscript = document.getElementById("file-transcript");
+const fileStatus = document.getElementById("file-status");
+const fileMeta = document.getElementById("file-meta");
+const fileSaved = document.getElementById("file-saved");
+
+uploadBtn.addEventListener("click", async () => {
+  const f = fileInput.files && fileInput.files[0];
+  if (!f) { fileStatus.textContent = "请先选择文件。"; return; }
+
+  uploadBtn.disabled = true;
+  uploadBtn.innerHTML = '<span class="spinner"></span> 转写中…';
+  fileStatus.textContent = "已上传，正在转写（长音频会分段处理，请耐心等待）……";
+  fileTranscript.innerHTML = '<span class="placeholder">转写中……</span>';
+  fileMeta.textContent = ""; fileSaved.textContent = "";
+
+  const form = new FormData();
+  form.append("file", f);
+  form.append("language", document.getElementById("file-lang").value);
+
+  try {
+    const resp = await fetch("/api/upload", { method: "POST", body: form });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || ("HTTP " + resp.status));
+    const esc = (t) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+    fileTranscript.innerHTML = data.text ? esc(data.text) : '<span class="placeholder">没有识别到语音内容。</span>';
+    fileMeta.textContent = `语言：${data.language || "(未知)"} · 时长：${data.seconds}s · 分段：${data.chunks}`;
+    if (data.saved && data.saved.transcript)
+      fileSaved.innerHTML = `已保存：<a href="/files/${encodeURIComponent(data.saved.transcript)}" target="_blank">${data.saved.transcript}</a>`;
+    fileStatus.textContent = "转写完成。";
+    loadHistory();
+  } catch (e) {
+    fileStatus.textContent = "转写失败：" + e.message;
+    fileTranscript.innerHTML = '<span class="placeholder">——</span>';
+  } finally {
+    uploadBtn.disabled = false;
+    uploadBtn.textContent = "开始转写";
+  }
+});
+
+// ---------------- 历史记录 ----------------
+const historyBox = document.getElementById("history-box");
+document.getElementById("refresh-btn").addEventListener("click", loadHistory);
+
+async function loadHistory() {
+  try {
+    const resp = await fetch("/api/history");
+    const data = await resp.json();
+    if (!data.items || data.items.length === 0) {
+      historyBox.innerHTML = '<div class="empty">暂无保存的转写结果。</div>';
+      return;
+    }
+    let html = "<table><tr><th>文件</th><th>时间</th><th>大小</th></tr>";
+    for (const it of data.items) {
+      html += `<tr><td><a href="/files/${encodeURIComponent(it.name)}" target="_blank">${it.name}</a></td>` +
+              `<td>${it.mtime}</td><td>${(it.size / 1024).toFixed(1)} KB</td></tr>`;
+    }
+    historyBox.innerHTML = html + "</table>";
+  } catch (e) {
+    historyBox.innerHTML = '<div class="empty">加载历史失败：' + e.message + "</div>";
+  }
+}
+
+loadHistory();
+</script>
+</body>
+</html>
