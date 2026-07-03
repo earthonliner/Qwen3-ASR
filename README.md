@@ -434,6 +434,25 @@ python scripts/record_and_transcribe.py --record --model ./models/Qwen3-ASR-0.6B
 | `--device` | `auto`/`mps`/`cpu`（默认 `auto`，在 Apple Silicon 上自动选 `mps`） |
 | `--output-dir` | 录音与转写结果的保存目录（默认 `./recordings`） |
 
+### 网页工具（录音准实时转写 + 文件上传转写）
+
+仓库内提供了一个本地网页工具 [`scripts/web_app.py`](scripts/web_app.py)：
+
+- **录音转写**：点击按钮开始录音，识别文字**边录边刷新**显示；停止后自动保存录音 wav 与转写 txt。
+- **文件转写**：上传音频/视频文件（wav / mp3 / m4a / mp4 …），显示并自动保存识别文本。
+- **历史记录**：页面下方可查看/下载所有已保存的转写结果。
+
+启动（需已装 `flask`，安装脚本已包含）：
+
+```bash
+python scripts/web_app.py --model ./models/Qwen3-ASR-0.6B-hf
+# 打开浏览器访问 http://127.0.0.1:8000
+```
+
+常用参数：`--port` 端口（默认 8000）；`--host 0.0.0.0` 允许局域网访问（注意浏览器只在 localhost 或 HTTPS 下允许录音）；`--segment-seconds` 准实时转写的段落上限（默认 25 秒，段落固化后文字不再变动）；`--output-dir` 保存目录（默认 `./recordings`）。
+
+> 实现说明：浏览器每 3 秒把麦克风音频块发给本地服务，服务端对当前段落做**增量转写**刷新结果（紫色为临时文字），段落满 25 秒后固化。macOS 没有 vLLM 无法做真流式解码，这种分段方案在 0.6B + MPS 下延迟约数秒，课堂场景够用。模型推理有全局锁，多人同时使用会排队。
+
 ### 常见问题
 
 - **报错 `AttributeError: 'NoneType' object has no attribute 'get'`（`rope_scaling`）？** 这是把 `-hf` 模型喂给了 `qwen-asr` 包。用本仓库脚本时它会自动选原生 transformers 后端；若你手写代码，请对 `-hf` 模型用 `AutoModelForMultimodalLM`，不要用 `qwen_asr.Qwen3ASRModel`。
