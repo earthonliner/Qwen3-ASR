@@ -283,6 +283,28 @@ def _ensure_torch_enabled_in_transformers() -> None:
         )
 
 
+def _ensure_native_qwen3_asr_support(model_path: str) -> None:
+    """
+    检查当前 transformers 是否原生认识 `qwen3_asr` 架构。很多已发布版本尚未包含，
+    需要从源码安装开发版。这里在真正加载前给出清晰指引，避免难懂的 KeyError 堆栈。
+    """
+    from transformers import AutoConfig
+
+    try:
+        AutoConfig.from_pretrained(model_path)
+    except Exception as e:  # KeyError / ValueError: model type qwen3_asr not recognized
+        msg = str(e)
+        if "qwen3_asr" in msg or "does not recognize this architecture" in msg:
+            raise SystemExit(
+                "当前 transformers 不认识 `qwen3_asr` 架构，说明这个版本还没有内置 Qwen3-ASR 原生支持。\n"
+                "请安装含该支持的 transformers 开发版（-hf 模型必需）：\n\n"
+                "    pip install -U 'git+https://github.com/huggingface/transformers'\n\n"
+                "安装后可用这条命令确认：\n"
+                "    python -c \"from transformers import Qwen3ASRForConditionalGeneration; print('ok')\"\n"
+            )
+        raise
+
+
 def _import_asr_model_class():
     import transformers
 
@@ -349,6 +371,7 @@ def run_transformers_backend(args, audio_16k: np.ndarray, device: str, dtype,
     from transformers import AutoProcessor
 
     _ensure_torch_enabled_in_transformers()
+    _ensure_native_qwen3_asr_support(args.model)
     asr_cls = _import_asr_model_class()
 
     print(f"正在加载 transformers 原生模型：{args.model}（首次运行会自动下载权重，请耐心等待）……")

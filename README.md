@@ -378,11 +378,11 @@ brew install ffmpeg portaudio
 conda create -n qwen3-asr python=3.12 -y
 conda activate qwen3-asr
 
-# PyTorch 的 macOS 官方 wheel 已内置 MPS 支持
-pip install -U torch torchaudio
-# -hf 模型需要含 Qwen3-ASR 原生支持的 transformers；若正式版还没包含，请装开发版：
-pip install -U "transformers>=4.57.6"
-# 或： pip install -U git+https://github.com/huggingface/transformers
+# PyTorch 的 macOS 官方 wheel 已内置 MPS 支持（需 >= 2.4）
+pip install -U "torch>=2.4" torchaudio
+# -hf 模型需要含 Qwen3-ASR(`qwen3_asr`) 原生支持的 transformers。很多已发布版本尚未包含，
+# 直接装源码开发版最稳：
+pip install -U "git+https://github.com/huggingface/transformers" accelerate
 pip install -U librosa soundfile sounddevice   # 音频读取 + 录音
 pip install -U nagisa soynlp                    # 仅日语/韩语时间戳需要
 
@@ -437,6 +437,14 @@ python scripts/record_and_transcribe.py --record --model ./models/Qwen3-ASR-0.6B
 ### 常见问题
 
 - **报错 `AttributeError: 'NoneType' object has no attribute 'get'`（`rope_scaling`）？** 这是把 `-hf` 模型喂给了 `qwen-asr` 包。用本仓库脚本时它会自动选原生 transformers 后端；若你手写代码，请对 `-hf` 模型用 `AutoModelForMultimodalLM`，不要用 `qwen_asr.Qwen3ASRModel`。
+- **报错 `KeyError: 'qwen3_asr'` 或 `Transformers does not recognize this architecture`？** 你的 transformers 还没有内置 Qwen3-ASR 原生支持（很多已发布版本尚未包含）。安装源码开发版：
+
+  ```bash
+  pip install -U "git+https://github.com/huggingface/transformers"
+  # 确认：
+  python -c "from transformers import Qwen3ASRForConditionalGeneration; print('ok')"
+  ```
+
 - **报错找不到 `AutoModelForMultimodalLM` / `apply_transcription_request`，或日志出现 `Disabling PyTorch because PyTorch >= 2.4 is required`？** 这是 **PyTorch 版本太旧**（新版 transformers 需要 PyTorch ≥ 2.4，否则会禁用 PyTorch，导致模型无法加载、processor 缺少音频方法）。升级 PyTorch：
 
   ```bash

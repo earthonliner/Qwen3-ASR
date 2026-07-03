@@ -122,9 +122,17 @@ python -m pip install -U "torch>=2.4" torchaudio
 
 if [[ "${USE_HF}" == "1" ]]; then
   info "安装 transformers（-hf 模型的原生支持）……"
-  # -hf 模型需要含 Qwen3-ASR 原生支持的 transformers。优先装稳定版，
-  # 若正式版尚未包含该支持，请改用开发版（见下方提示）。
-  python -m pip install -U "transformers>=4.57.6" accelerate
+  python -m pip install -U accelerate
+  # -hf 模型需要含 Qwen3-ASR(`qwen3_asr`) 原生支持的 transformers。很多已发布版本尚未包含，
+  # 直接安装源码开发版最稳（可用 TRANSFORMERS_SPEC 覆盖，如指定某个 tag/分支）。
+  TRANSFORMERS_SPEC="${TRANSFORMERS_SPEC:-git+https://github.com/huggingface/transformers}"
+  info "安装 transformers：${TRANSFORMERS_SPEC}"
+  python -m pip install -U "${TRANSFORMERS_SPEC}"
+  info "校验 qwen3_asr 原生支持……"
+  if ! python -c "from transformers import Qwen3ASRForConditionalGeneration" >/dev/null 2>&1; then
+    warn "当前 transformers 仍不认识 qwen3_asr；如仍报错，请确认已安装源码开发版："
+    warn "    pip install -U 'git+https://github.com/huggingface/transformers'"
+  fi
   info "安装音频处理依赖（librosa / soundfile / nagisa / soynlp）……"
   python -m pip install -U librosa soundfile nagisa soynlp
 else
