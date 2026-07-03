@@ -254,8 +254,35 @@ def write_outputs(args, text: str, language: str, timestamps: Optional[List[dict
 # ---------------------------------------------------------------------------
 # 后端 A0：MLX（mlx-community 模型，Apple Silicon 最快）
 # ---------------------------------------------------------------------------
+def _patch_mlx_lm_transformers_compat() -> None:
+    """
+    兼容补丁：mlx-lm 在导入时调用 AutoTokenizer.register("NewlineTokenizer", ...)（传字符串），
+    transformers v5 起要求传类对象（内部访问 key.__module__），导致
+    `AttributeError: 'str' object has no attribute '__module__'`。
+    这里包一层：字符串注册失败时静默跳过（Qwen3-ASR 不使用 NewlineTokenizer，跳过无影响）。
+    """
+    try:
+        from transformers import AutoTokenizer
+    except ImportError:
+        return
+
+    orig = AutoTokenizer.register.__func__ if hasattr(AutoTokenizer.register, "__func__") \
+        else AutoTokenizer.register
+
+    def _safe_register(config_class, *args, **kwargs):
+        if isinstance(config_class, str):
+            try:
+                return orig(config_class, *args, **kwargs)
+            except AttributeError:
+                return None
+        return orig(config_class, *args, **kwargs)
+
+    AutoTokenizer.register = staticmethod(_safe_register)
+
+
 def _load_mlx_model(model_path: str):
     """加载 mlx-audio 的 STT 模型，兼容不同版本的入口。"""
+    _patch_mlx_lm_transformers_compat()
     try:
         try:
             from mlx_audio.stt.utils import load_model as _load
