@@ -17,18 +17,27 @@
 在 Apple Silicon Mac（如 MacBook Air M2 / 16GB）上，用 Qwen3-ASR-0.6B 录制并转写
 课堂上老师与学生的对话。
 
+支持两套模型/后端，脚本会根据模型名自动选择：
+
+1) transformers 原生版（推荐给带 -hf 后缀的仓库，如 Qwen/Qwen3-ASR-0.6B-hf）
+   - 用 🤗 transformers 原生的 AutoModelForMultimodalLM + processor.apply_transcription_request
+   - 需要较新的 transformers（含 Qwen3-ASR 原生支持）
+
+2) qwen-asr 包版（用于不带 -hf 的仓库，如 Qwen/Qwen3-ASR-0.6B）
+   - 用 qwen_asr.Qwen3ASRModel
+
 两种使用方式：
 
-1) 现场录音后转写（讲课过程中运行，结束时按 Ctrl+C 停止录音）：
-       python scripts/record_and_transcribe.py --record --timestamps
+   # 现场录音后转写（讲课过程中运行，结束时按 Ctrl+C 停止录音）
+   python scripts/record_and_transcribe.py --record --model Qwen/Qwen3-ASR-0.6B-hf --timestamps
 
-2) 转写一个已有的音频/视频文件（wav / mp3 / m4a / mp4 …，需已安装 ffmpeg）：
-       python scripts/record_and_transcribe.py --audio ./lesson.m4a --language Chinese
+   # 转写一个已有的音频/视频文件（wav / mp3 / m4a / mp4 …，需已安装 ffmpeg）
+   python scripts/record_and_transcribe.py --audio ./lesson.m4a --model Qwen/Qwen3-ASR-0.6B-hf --language Chinese
 
 说明：
-- 该脚本使用 transformers 后端 + Apple Silicon 的 MPS(Metal) 加速；vLLM 在 macOS 上不可用。
-- 0.6B 模型在 16GB 内存的 M2 上可以离线运行；长音频会自动分段处理。
-- 模型本身只做「语音识别 + 时间戳」，不做说话人分离(diarization)，
+- macOS 上通过 MPS(Metal) 做 GPU 加速；vLLM 在 macOS 上不可用。
+- 0.6B 模型在 16GB 内存的 M2 上可离线运行；长音频会自动分段处理。
+- 该模型只做「语音识别 + 时间戳」，不做说话人分离(diarization)，
   因此无法自动区分「谁是老师、谁是学生」；时间戳可帮助你按时间顺序回看对话。
 """
 
@@ -36,8 +45,12 @@ import argparse
 import datetime as _dt
 import os
 import sys
+import tempfile
 import time
-from typing import Optional
+from typing import List, Optional, Tuple
+
+# 让 MPS 上不支持的算子自动回退到 CPU，避免在 Apple Silicon 上直接报错。
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import numpy as np
 
@@ -45,8 +58,16 @@ SAMPLE_RATE = 16000  # Qwen3-ASR 使用 16kHz 单声道输入
 
 
 # ---------------------------------------------------------------------------
-# 设备 / 精度自动选择
+# 后端 / 设备 / 精度选择
 # ---------------------------------------------------------------------------
+def resolve_backend(backend: str, model_name: str) -> str:
+    """auto 时：带 -hf 后缀走 transformers 原生后端，否则走 qwen-asr 包后端。"""
+    if backend != "auto":
+        return backend
+    base = os.path.basename(str(model_name).rstrip("/"))
+    return "transformers" if base.endswith("-hf") else "package"
+
+
 def pick_device(requested: str) -> str:
     """选择运行设备：auto 时优先 Apple Silicon 的 mps，否则回退到 cpu。"""
     import torch
@@ -76,7 +97,7 @@ def pick_dtype(requested: str, device: str):
 
 
 # ---------------------------------------------------------------------------
-# 录音
+# 录音 / 音频读取
 # ---------------------------------------------------------------------------
 def record_from_microphone(max_seconds: Optional[float] = None) -> np.ndarray:
     """
@@ -89,7 +110,7 @@ def record_from_microphone(max_seconds: Optional[float] = None) -> np.ndarray:
     """
     try:
         import sounddevice as sd
-    except Exception as e:  # pragma: no cover - 依赖缺失时的友好提示
+    except Exception as e:  # pragma: no cover
         raise SystemExit(
             "缺少 sounddevice 依赖，无法录音。请先安装：\n"
             "    pip install sounddevice\n"
@@ -129,7 +150,7 @@ def record_from_microphone(max_seconds: Optional[float] = None) -> np.ndarray:
     except KeyboardInterrupt:
         pass
     finally:
-        print()  # 换行
+        print()
 
     if not frames:
         raise SystemExit("没有录到任何音频，请检查麦克风权限（系统设置 → 隐私与安全性 → 麦克风）。")
@@ -139,18 +160,36 @@ def record_from_microphone(max_seconds: Optional[float] = None) -> np.ndarray:
     return audio
 
 
+def load_audio_16k(path: str) -> np.ndarray:
+    """把本地音频/视频文件读取为 16kHz 单声道 float32 波形。"""
+    import librosa
+
+    audio, _ = librosa.load(path, sr=SAMPLE_RATE, mono=True)
+    return np.asarray(audio, dtype=np.float32)
+
+
 def save_wav(audio: np.ndarray, path: str) -> None:
     import soundfile as sf
 
     sf.write(path, audio, SAMPLE_RATE)
 
 
+def split_fixed(audio: np.ndarray, chunk_seconds: float) -> List[Tuple[np.ndarray, float]]:
+    """把长音频按固定时长切成若干段，返回 [(chunk, offset_sec), ...]。"""
+    if chunk_seconds is None or chunk_seconds <= 0 or len(audio) <= int(chunk_seconds * SAMPLE_RATE):
+        return [(audio, 0.0)]
+    step = int(chunk_seconds * SAMPLE_RATE)
+    out: List[Tuple[np.ndarray, float]] = []
+    for start in range(0, len(audio), step):
+        out.append((audio[start : start + step], start / float(SAMPLE_RATE)))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 输出格式化
 # ---------------------------------------------------------------------------
 def _fmt_ts(seconds: float) -> str:
-    td = _dt.timedelta(seconds=float(seconds))
-    total = td.total_seconds()
+    total = float(seconds)
     h, rem = divmod(int(total), 3600)
     m, s = divmod(rem, 60)
     ms = int((total - int(total)) * 1000)
@@ -159,19 +198,245 @@ def _fmt_ts(seconds: float) -> str:
     return f"{m:02d}:{s:02d}.{ms:03d}"
 
 
-def format_timestamps(result) -> str:
-    """把 forced aligner 的逐词/逐字时间戳汇总为一段可读文本。"""
-    ts = getattr(result, "time_stamps", None)
-    if not ts:
+def format_timestamps(timestamps: Optional[List[dict]]) -> str:
+    """把统一后的时间戳列表 [{text,start_time,end_time}] 汇总为可读文本。"""
+    if not timestamps:
         return ""
     lines = []
-    for item in ts:
-        lines.append(f"[{_fmt_ts(item.start_time)} -> {_fmt_ts(item.end_time)}] {item.text}")
+    for item in timestamps:
+        lines.append(f"[{_fmt_ts(item['start_time'])} -> {_fmt_ts(item['end_time'])}] {item['text']}")
     return "\n".join(lines)
 
 
+def write_outputs(args, text: str, language: str, timestamps: Optional[List[dict]],
+                  saved_wav_path: Optional[str], source: Optional[str], stamp: str) -> None:
+    print("=" * 60)
+    print(f"检测/使用语言：{language or '(未知)'}")
+    print("-" * 60)
+    print(text or "(未识别到语音内容)")
+    print("=" * 60)
+
+    out_path = args.output or os.path.join(args.output_dir, f"transcript_{stamp}.txt")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("# Qwen3-ASR 课堂转写\n")
+        f.write(f"# 时间：{_dt.datetime.now().isoformat(timespec='seconds')}\n")
+        f.write(f"# 模型：{args.model}\n")
+        if saved_wav_path:
+            f.write(f"# 录音文件：{saved_wav_path}\n")
+        elif source:
+            f.write(f"# 源文件：{source}\n")
+        f.write(f"# 语言：{language or '(未知)'}\n\n")
+        f.write("## 全文\n")
+        f.write((text or "").strip() + "\n")
+        if args.timestamps:
+            ts_text = format_timestamps(timestamps)
+            if ts_text:
+                f.write("\n## 时间戳（逐词/逐字）\n")
+                f.write(ts_text + "\n")
+
+    print(f"\n转写文本已保存到：{out_path}")
+    if args.timestamps and timestamps:
+        print("（文件中包含逐词/逐字时间戳，可按时间顺序回看老师与学生的对话。）")
+
+
 # ---------------------------------------------------------------------------
-# 主流程
+# 后端 A：transformers 原生（-hf 模型）
+# ---------------------------------------------------------------------------
+def _import_asr_model_class():
+    import transformers
+
+    for name in ("AutoModelForMultimodalLM", "Qwen3ASRForConditionalGeneration"):
+        cls = getattr(transformers, name, None)
+        if cls is not None:
+            return cls
+    raise SystemExit(
+        "当前 transformers 版本没有 Qwen3-ASR 的原生支持（找不到 AutoModelForMultimodalLM / "
+        "Qwen3ASRForConditionalGeneration）。\n"
+        "使用 -hf 模型需要较新的 transformers，请升级：\n"
+        "    pip install -U transformers\n"
+        "或安装开发版：\n"
+        "    pip install -U git+https://github.com/huggingface/transformers\n"
+    )
+
+
+def run_transformers_backend(args, audio_16k: np.ndarray, device: str, dtype,
+                             saved_wav_path: Optional[str], source: Optional[str], stamp: str) -> None:
+    import torch
+    from transformers import AutoProcessor
+
+    asr_cls = _import_asr_model_class()
+
+    print(f"正在加载 transformers 原生模型：{args.model}（首次运行会自动下载权重，请耐心等待）……")
+    t0 = time.time()
+    processor = AutoProcessor.from_pretrained(args.model)
+    if not hasattr(processor, "apply_transcription_request"):
+        raise SystemExit(
+            "processor 缺少 apply_transcription_request，说明 transformers 版本过旧，无法使用 -hf 模型。\n"
+            "请升级：pip install -U transformers（或 git+https://github.com/huggingface/transformers）。"
+        )
+    model = asr_cls.from_pretrained(args.model, dtype=dtype)
+    model.to(device)
+    model.eval()
+
+    aligner_model = None
+    aligner_processor = None
+    if args.timestamps:
+        from transformers import AutoModelForTokenClassification
+
+        print(f"正在加载对齐模型：{args.aligner} ……")
+        aligner_processor = AutoProcessor.from_pretrained(args.aligner)
+        aligner_model = AutoModelForTokenClassification.from_pretrained(args.aligner, dtype=dtype)
+        aligner_model.to(device)
+        aligner_model.eval()
+    print(f"模型加载完成，用时 {time.time() - t0:.1f} 秒。开始转写……")
+
+    chunks = split_fixed(audio_16k, args.chunk_seconds)
+    if len(chunks) > 1:
+        print(f"音频较长，已按 {args.chunk_seconds:.0f} 秒切成 {len(chunks)} 段处理。")
+
+    all_text: List[str] = []
+    all_lang: List[str] = []
+    all_ts: List[dict] = []
+
+    t0 = time.time()
+    for idx, (chunk, offset) in enumerate(chunks):
+        if len(chunks) > 1:
+            print(f"\r正在转写第 {idx + 1}/{len(chunks)} 段……", end="", flush=True)
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        try:
+            save_wav(chunk, tmp_path)
+
+            inputs = processor.apply_transcription_request(audio=tmp_path, language=args.language)
+            inputs = inputs.to(model.device, model.dtype)
+            with torch.inference_mode():
+                output_ids = model.generate(**inputs, max_new_tokens=args.max_new_tokens)
+            generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
+            parsed = processor.decode(generated_ids, return_format="parsed")[0]
+
+            text = (parsed.get("transcription") or "").strip()
+            lang = parsed.get("language") or ""
+            if text:
+                all_text.append(text)
+            if lang:
+                all_lang.append(lang)
+
+            if args.timestamps and text:
+                ts = _align_transformers(
+                    aligner_model, aligner_processor, tmp_path, text,
+                    lang or args.language or "English", offset, device,
+                )
+                all_ts.extend(ts)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    if len(chunks) > 1:
+        print()
+    print(f"转写完成，用时 {time.time() - t0:.1f} 秒。\n")
+
+    # 合并语言（去掉连续重复）
+    merged_lang: List[str] = []
+    for l in all_lang:
+        if l and (not merged_lang or merged_lang[-1] != l):
+            merged_lang.append(l)
+
+    write_outputs(
+        args,
+        text=" ".join(all_text).strip(),
+        language=",".join(merged_lang),
+        timestamps=all_ts if args.timestamps else None,
+        saved_wav_path=saved_wav_path,
+        source=source,
+        stamp=stamp,
+    )
+
+
+def _align_transformers(aligner_model, aligner_processor, audio_path: str, transcript: str,
+                        language: str, offset_sec: float, device: str) -> List[dict]:
+    """用 transformers 原生的 ForcedAligner 计算单段时间戳，并加上时间偏移。"""
+    import torch
+
+    try:
+        aligner_inputs, word_lists = aligner_processor.prepare_forced_aligner_inputs(
+            audio=audio_path, transcript=transcript, language=language,
+        )
+        aligner_inputs = aligner_inputs.to(aligner_model.device, aligner_model.dtype)
+        with torch.inference_mode():
+            outputs = aligner_model(**aligner_inputs)
+        timestamps = aligner_processor.decode_forced_alignment(
+            logits=outputs.logits,
+            input_ids=aligner_inputs["input_ids"],
+            word_lists=word_lists,
+            timestamp_token_id=aligner_model.config.timestamp_token_id,
+        )[0]
+    except Exception as e:  # 对齐失败不应影响转写主流程
+        print(f"\n[对齐警告] 本段时间戳计算失败，已跳过：{e}", file=sys.stderr)
+        return []
+
+    out: List[dict] = []
+    for item in timestamps:
+        out.append({
+            "text": item["text"],
+            "start_time": float(item["start_time"]) + offset_sec,
+            "end_time": float(item["end_time"]) + offset_sec,
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 后端 B：qwen-asr 包（非 -hf 模型）
+# ---------------------------------------------------------------------------
+def run_package_backend(args, audio_input, device: str, dtype,
+                        saved_wav_path: Optional[str], source: Optional[str], stamp: str) -> None:
+    from qwen_asr import Qwen3ASRModel
+
+    load_kwargs = dict(
+        dtype=dtype,
+        device_map=device,
+        max_inference_batch_size=1,
+        max_new_tokens=args.max_new_tokens,
+    )
+    if args.timestamps:
+        load_kwargs["forced_aligner"] = args.aligner
+        load_kwargs["forced_aligner_kwargs"] = dict(dtype=dtype, device_map=device)
+
+    print(f"正在加载 qwen-asr 模型：{args.model}（首次运行会自动下载权重，请耐心等待）……")
+    t0 = time.time()
+    model = Qwen3ASRModel.from_pretrained(args.model, **load_kwargs)
+    print(f"模型加载完成，用时 {time.time() - t0:.1f} 秒。开始转写……")
+
+    t0 = time.time()
+    results = model.transcribe(
+        audio=audio_input,
+        language=args.language,
+        return_time_stamps=args.timestamps,
+    )
+    print(f"转写完成，用时 {time.time() - t0:.1f} 秒。\n")
+
+    result = results[0]
+    timestamps = None
+    if args.timestamps and getattr(result, "time_stamps", None):
+        timestamps = [
+            {"text": it.text, "start_time": float(it.start_time), "end_time": float(it.end_time)}
+            for it in result.time_stamps
+        ]
+
+    write_outputs(
+        args,
+        text=result.text or "",
+        language=result.language or "",
+        timestamps=timestamps,
+        saved_wav_path=saved_wav_path,
+        source=source,
+        stamp=stamp,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 命令行
 # ---------------------------------------------------------------------------
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -180,18 +445,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--record", action="store_true", help="从麦克风现场录音后转写。")
-    src.add_argument("--audio", type=str, help="转写已有的音频/视频文件路径（需 ffmpeg 支持的格式）。")
+    src.add_argument("--audio", type=str, help="转写已有的本地音频/视频文件路径（需 ffmpeg 支持的格式）。")
 
     p.add_argument("--duration", type=float, default=None,
                    help="录音模式下的最长录制秒数；不填则一直录到 Ctrl+C。")
-    p.add_argument("--model", type=str, default="Qwen/Qwen3-ASR-0.6B",
-                   help="ASR 模型名或本地目录（默认 0.6B，适合 16GB 的 M2）。")
+    p.add_argument("--model", type=str, default="Qwen/Qwen3-ASR-0.6B-hf",
+                   help="ASR 模型名或本地目录。带 -hf 用 transformers 原生后端，不带 -hf 用 qwen-asr 包后端。")
+    p.add_argument("--backend", type=str, default="auto", choices=["auto", "transformers", "package"],
+                   help="推理后端；auto 会根据模型名是否带 -hf 自动选择。")
     p.add_argument("--language", type=str, default=None,
-                   help="强制识别语言（如 Chinese / English）；不填则自动检测，适合中英混说的课堂。")
+                   help="强制识别语言（如 Chinese / English，或 zh / en）；不填则自动检测，适合中英混说的课堂。")
     p.add_argument("--timestamps", action="store_true",
                    help="输出逐词/逐字时间戳（会额外加载 ForcedAligner，占用更多内存/时间）。")
-    p.add_argument("--aligner", type=str, default="Qwen/Qwen3-ForcedAligner-0.6B",
-                   help="时间戳对齐模型名或本地目录（配合 --timestamps 使用）。")
+    p.add_argument("--aligner", type=str, default=None,
+                   help="时间戳对齐模型（不填则根据后端自动选择 -hf / 非 -hf 版本）。")
     p.add_argument("--device", type=str, default="auto",
                    choices=["auto", "mps", "cpu", "cuda:0"],
                    help="运行设备；auto 会在 Apple Silicon 上自动选择 mps。")
@@ -200,6 +467,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="计算精度；auto 时 mps 用 float16、cpu 用 float32。")
     p.add_argument("--max-new-tokens", type=int, default=1024,
                    help="每段最多生成的 token 数；课堂长音频建议设大一些。")
+    p.add_argument("--chunk-seconds", type=float, default=30.0,
+                   help="transformers 后端处理长音频时的分段时长（秒）。qwen-asr 后端会自行分段，忽略该值。")
     p.add_argument("--output-dir", type=str, default="./recordings",
                    help="录音与转写结果的保存目录。")
     p.add_argument("--output", type=str, default=None,
@@ -210,86 +479,55 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_arg_parser().parse_args()
 
+    backend = resolve_backend(args.backend, args.model)
+
+    # 自动选择对齐模型版本，与后端保持一致（-hf 配 -hf）。
+    if args.aligner is None:
+        args.aligner = (
+            "Qwen/Qwen3-ForcedAligner-0.6B-hf" if backend == "transformers"
+            else "Qwen/Qwen3-ForcedAligner-0.6B"
+        )
+
     os.makedirs(args.output_dir, exist_ok=True)
     stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # 1) 取得音频输入（录音或读取文件）
-    audio_input = None  # 传给 model.transcribe 的对象
+    # 1) 取得音频输入
     saved_wav_path = None
-    if args.record:
-        audio = record_from_microphone(max_seconds=args.duration)
-        saved_wav_path = os.path.join(args.output_dir, f"class_{stamp}.wav")
-        save_wav(audio, saved_wav_path)
-        print(f"录音已保存到：{saved_wav_path}")
-        audio_input = (audio, SAMPLE_RATE)
-    else:
-        if not os.path.exists(args.audio):
-            raise SystemExit(f"找不到音频文件：{args.audio}")
-        audio_input = args.audio
+    source = None
+    audio_16k = None       # transformers 后端使用的 16k np 数组
+    audio_input = None     # qwen-asr 后端使用的输入（(array, sr) 或 路径）
 
-    # 2) 选择设备/精度并加载模型（延迟 import，加快 --help）
+    if args.record:
+        audio_16k = record_from_microphone(max_seconds=args.duration)
+        saved_wav_path = os.path.join(args.output_dir, f"class_{stamp}.wav")
+        save_wav(audio_16k, saved_wav_path)
+        print(f"录音已保存到：{saved_wav_path}")
+        audio_input = (audio_16k, SAMPLE_RATE)
+    else:
+        is_url = str(args.audio).startswith(("http://", "https://"))
+        if backend == "transformers" and is_url:
+            raise SystemExit("transformers 后端仅支持本地文件；请先把音频下载到本地，再用 --audio 指向它。")
+        if not is_url and not os.path.exists(args.audio):
+            raise SystemExit(f"找不到音频文件：{args.audio}")
+        source = args.audio
+        audio_input = args.audio  # qwen-asr 后端可直接吃路径 / URL
+
+    # 2) 设备 / 精度
     import torch  # noqa: F401
-    from qwen_asr import Qwen3ASRModel
 
     device = pick_device(args.device)
     dtype = pick_dtype(args.dtype, device)
-    print(f"使用设备：{device}，精度：{str(dtype).replace('torch.', '')}")
+    print(f"后端：{backend}，设备：{device}，精度：{str(dtype).replace('torch.', '')}")
     if device == "cpu":
         print("[提示] 未启用 MPS，正在使用 CPU，速度会明显偏慢。")
 
-    load_kwargs = dict(
-        dtype=dtype,
-        device_map=device,
-        max_inference_batch_size=1,  # 单路课堂音频，batch=1 更省内存
-        max_new_tokens=args.max_new_tokens,
-    )
-    if args.timestamps:
-        load_kwargs["forced_aligner"] = args.aligner
-        load_kwargs["forced_aligner_kwargs"] = dict(dtype=dtype, device_map=device)
-
-    print(f"正在加载模型：{args.model}（首次运行会自动下载权重，请耐心等待）……")
-    t0 = time.time()
-    model = Qwen3ASRModel.from_pretrained(args.model, **load_kwargs)
-    print(f"模型加载完成，用时 {time.time() - t0:.1f} 秒。开始转写……")
-
-    # 3) 转写
-    t0 = time.time()
-    results = model.transcribe(
-        audio=audio_input,
-        language=args.language,
-        return_time_stamps=args.timestamps,
-    )
-    print(f"转写完成，用时 {time.time() - t0:.1f} 秒。\n")
-
-    result = results[0]
-
-    # 4) 打印 + 保存
-    print("=" * 60)
-    print(f"检测/使用语言：{result.language or '(未知)'}")
-    print("-" * 60)
-    print(result.text or "(未识别到语音内容)")
-    print("=" * 60)
-
-    out_path = args.output or os.path.join(args.output_dir, f"transcript_{stamp}.txt")
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(f"# Qwen3-ASR 课堂转写\n")
-        f.write(f"# 时间：{_dt.datetime.now().isoformat(timespec='seconds')}\n")
-        if saved_wav_path:
-            f.write(f"# 录音文件：{saved_wav_path}\n")
-        elif args.audio:
-            f.write(f"# 源文件：{args.audio}\n")
-        f.write(f"# 语言：{result.language or '(未知)'}\n\n")
-        f.write("## 全文\n")
-        f.write((result.text or "").strip() + "\n")
-        if args.timestamps:
-            ts_text = format_timestamps(result)
-            if ts_text:
-                f.write("\n## 时间戳（逐词/逐字）\n")
-                f.write(ts_text + "\n")
-
-    print(f"\n转写文本已保存到：{out_path}")
-    if args.timestamps:
-        print("（文件中包含逐词/逐字时间戳，可按时间顺序回看老师与学生的对话。）")
+    # 3) 分后端执行
+    if backend == "transformers":
+        if audio_16k is None:
+            audio_16k = load_audio_16k(args.audio)
+        run_transformers_backend(args, audio_16k, device, dtype, saved_wav_path, source, stamp)
+    else:
+        run_package_backend(args, audio_input, device, dtype, saved_wav_path, source, stamp)
 
 
 if __name__ == "__main__":
