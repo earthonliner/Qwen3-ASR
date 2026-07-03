@@ -207,8 +207,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _check_model_variant(name: str, kind: str) -> None:
+    """
+    qwen-asr 包需要「非 -hf」版本的仓库（如 Qwen/Qwen3-ASR-0.6B）。
+    带 -hf 后缀的仓库是给「原生 transformers」用法准备的，配置结构不同，
+    直接用会报 `'NoneType' object has no attribute 'get'`（rope_scaling 为 None）。
+    """
+    base = os.path.basename(str(name).rstrip("/"))
+    if base.endswith("-hf"):
+        suggested = name[: -len("-hf")] if name.endswith("-hf") else name.replace("-hf", "")
+        repo_id = "Qwen/" + base[: -len("-hf")]  # 规范仓库 id，如 Qwen/Qwen3-ASR-0.6B
+        local_dir = f"./models/{base[: -len('-hf')]}"
+        flag = "aligner" if kind.startswith("对齐") else "model"
+        raise SystemExit(
+            f"检测到 {kind} 使用了 -hf 版本：{name}\n\n"
+            "qwen-asr 这个 Python 包不支持 -hf 变体（那是给原生 transformers 用法的，配置不兼容，\n"
+            "会报 'NoneType' object has no attribute 'get'）。请改用不带 -hf 的仓库。\n\n"
+            "重新下载（二选一）：\n"
+            f"    modelscope download --model {repo_id} --local_dir {local_dir}\n"
+            f"    huggingface-cli download {repo_id} --local-dir {local_dir}\n\n"
+            "然后指向本地目录：\n"
+            f"    --{flag} {local_dir}\n\n"
+            f"或直接用 --{flag} {repo_id} 自动下载（也可省略 --model 使用默认的 Qwen/Qwen3-ASR-0.6B）。"
+        )
+
+
 def main() -> None:
     args = build_arg_parser().parse_args()
+
+    _check_model_variant(args.model, "ASR 模型")
+    if args.timestamps:
+        _check_model_variant(args.aligner, "对齐模型")
 
     os.makedirs(args.output_dir, exist_ok=True)
     stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")

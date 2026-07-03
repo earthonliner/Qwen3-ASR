@@ -338,6 +338,8 @@ To further explore Qwen3-ASR, we encourage you to try our DashScope API for a fa
 - **0.6B** 模型体量小（bf16/fp16 权重约 1~2GB），在 **16GB 统一内存**的 M2 上可以流畅离线运行；1.7B 也能跑，但更吃内存、更慢，日常课堂转写推荐 **0.6B**。
 - 该模型只做 **语音识别 + 时间戳对齐**，**不做说话人分离（diarization）**，所以无法自动区分「哪句是老师、哪句是学生」；开启时间戳后可按时间顺序回看整段对话。
 
+> ⚠️ **务必使用不带 `-hf` 后缀的仓库**（如 `Qwen/Qwen3-ASR-0.6B`）。带 `-hf` 的仓库（`Qwen/Qwen3-ASR-0.6B-hf`）是给**原生 transformers** 用法准备的，其配置与 `qwen-asr` 包不兼容，加载时会报 `AttributeError: 'NoneType' object has no attribute 'get'`（`rope_scaling` 为 `None`）。本节脚本基于 `qwen-asr` 包，请使用非 `-hf` 版本。
+
 ### 一键安装
 
 仓库内提供了安装脚本 [`scripts/setup_mac.sh`](scripts/setup_mac.sh)，会自动安装 `ffmpeg`、`portaudio`、PyTorch（含 MPS）、`qwen-asr` 以及录音依赖 `sounddevice`：
@@ -414,6 +416,16 @@ python scripts/record_and_transcribe.py --record --model ./models/Qwen3-ASR-0.6B
 | `--output-dir` | 录音与转写结果的保存目录（默认 `./recordings`） |
 
 ### 常见问题
+
+- **报错 `AttributeError: 'NoneType' object has no attribute 'get'`（`rope_scaling`）？** 说明用成了 `-hf` 版本的模型。请改用非 `-hf` 仓库重新下载：
+
+  ```bash
+  # 二选一
+  modelscope download --model Qwen/Qwen3-ASR-0.6B --local_dir ./models/Qwen3-ASR-0.6B
+  huggingface-cli download Qwen/Qwen3-ASR-0.6B --local-dir ./models/Qwen3-ASR-0.6B
+  # 然后
+  python scripts/record_and_transcribe.py --record --model ./models/Qwen3-ASR-0.6B
+  ```
 
 - **速度慢？** 确认日志里显示 `使用设备：mps`。首次运行需下载模型权重与做 MPS 预热，之后会明显变快。长音频会被自动分段处理，请耐心等待。
 - **报错 `sounddevice` / PortAudio 找不到设备？** 先 `brew install portaudio` 再 `pip install -U sounddevice`，并检查麦克风权限。
