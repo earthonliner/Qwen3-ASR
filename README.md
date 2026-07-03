@@ -485,6 +485,7 @@ python scripts/web_app.py --model ./models/Qwen3-ASR-0.6B-hf
 ### 常见问题
 
 - **MLX 后端报 `No module named 'mlx_audio'` 或安装失败？** `pip install -U mlx-audio`；注意 MLX 仅支持 Apple Silicon 原生（arm64）Python 环境，Intel/Rosetta 环境装不了（检查：`python -c "import platform; print(platform.machine())"` 应为 `arm64`）。
+- **网页工具 + MLX 报 `RuntimeError: There is no Stream(gpu, N) in current thread`？** MLX 的计算流绑定创建线程，而 Flask 每个请求在不同线程。本仓库网页工具已把 MLX 加载与推理固定到专用工作线程（拉取最新代码即可）；自己写多线程服务时也需同样处理。
 - **MLX 后端报 `AttributeError: 'str' object has no attribute '__module__'`（`AutoTokenizer.register`）？** 这是 `mlx-lm` 与新版 transformers（v5+/开发版）的兼容问题：`mlx-lm` 导入时用字符串注册 `NewlineTokenizer`，新版 transformers 要求传类对象。本仓库脚本已内置兼容补丁（加载 MLX 模型前自动生效），拉取最新代码即可；也可尝试 `pip install -U mlx-lm mlx-audio` 升级到已修复的版本。
 - **报错 `AttributeError: 'NoneType' object has no attribute 'get'`（`rope_scaling`）？** 这是把 `-hf` 模型喂给了 `qwen-asr` 包。用本仓库脚本时它会自动选原生 transformers 后端；若你手写代码，请对 `-hf` 模型用 `AutoModelForMultimodalLM`，不要用 `qwen_asr.Qwen3ASRModel`。
 - **报错 `KeyError: 'qwen3_asr'` 或 `Transformers does not recognize this architecture`？** 你的 transformers 还没有内置 Qwen3-ASR 原生支持（很多已发布版本尚未包含）。安装源码开发版：
